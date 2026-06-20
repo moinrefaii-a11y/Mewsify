@@ -122,6 +122,12 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       mediaItem.add(_queue[_currentIndex].toMediaItem());
     }
 
+    // Resolve audio URL in the background so the app doesn't freeze
+    // on the splash screen waiting for a network response.
+    unawaited(_loadRestoredTrack(savedPositionMs));
+  }
+
+  Future<void> _loadRestoredTrack(int savedPositionMs) async {
     try {
       final track = _queue[_currentIndex];
       final url = await _yt.resolveAudioUrl(track.sourceVideoId);
@@ -130,7 +136,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         initialPosition: Duration(milliseconds: savedPositionMs),
       );
     } catch (_) {
-      // ignore
+      // Network unavailable at startup — user can tap play later.
     }
   }
 
@@ -169,7 +175,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _appendRelatedToQueue(seed.sourceVideoId);
   }
 
-  Future<void> _playIndex(int index) async {
+  Future<void> _playIndex(int index, [int retryCount = 0]) async {
     if (index < 0 || index >= _queue.length) return;
     _currentIndex = index;
     final track = _queue[index];
@@ -183,6 +189,10 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       await _player.play();
       _scheduleCrossfade();
     } catch (e) {
+      if (retryCount < 1) {
+        await Future.delayed(const Duration(milliseconds: 800));
+        return _playIndex(index, retryCount + 1);
+      }
       _completionEnabled = false;
       errorEvents.add('Could not load track: $e');
     }
@@ -288,7 +298,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
   // --- Track-end handling ----------------------------------------------
 
-  void _onTrackCompleted() async {
+  Future<void> _onTrackCompleted() async {
     final mode = repeatMode.value;
     if (mode == PlaybackRepeat.one) {
       await _player.seek(Duration.zero);
@@ -479,9 +489,9 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
   // --- Public read-only state -------------------------------------------
 
-  Stream<Duration> get positionStream => _a.positionStream;
-  Stream<Duration?> get durationStream => _a.durationStream;
-  Stream<bool> get playingStream => _a.playingStream;
+  Stream<Duration> get positionStream => _player.positionStream;
+  Stream<Duration?> get durationStream => _player.durationStream;
+  Stream<bool> get playingStream => _player.playingStream;
   AudioPlayer get rawPlayer => _player;
   List<Track> get currentQueue => List.unmodifiable(_queue);
   int get currentIndex => _currentIndex;

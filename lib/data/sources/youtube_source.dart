@@ -149,7 +149,8 @@ class YouTubeSource {
     for (final client in _clientFallbacks) {
       try {
         final manifest = await _yt.videos.streamsClient
-            .getManifest(videoId, ytClients: [client]);
+            .getManifest(videoId, ytClients: [client])
+            .timeout(const Duration(seconds: 8));
         if (manifest.audioOnly.isEmpty && manifest.muxed.isEmpty) continue;
         debugPrint('[YouTubeSource] manifest via $client');
         return manifest;

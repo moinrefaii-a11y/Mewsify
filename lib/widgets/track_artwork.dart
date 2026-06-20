@@ -83,8 +83,14 @@ class _TrackArtworkState extends State<TrackArtwork> {
       width: widget.width,
       height: widget.height,
       fit: widget.fit,
+      fadeInDuration: const Duration(milliseconds: 200),
+      fadeOutDuration: const Duration(milliseconds: 100),
+      placeholder: (_, __) => Container(
+        width: widget.width,
+        height: widget.height,
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      ),
       errorWidget: (context, _, __) {
-        // Move to the next fallback URL on the next frame and rebuild.
         if (_index + 1 < _candidates.length) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) setState(() => _index += 1);

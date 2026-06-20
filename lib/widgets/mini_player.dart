@@ -24,7 +24,7 @@ class MiniPlayer extends ConsumerWidget {
 
     final handler = ref.read(audioHandlerProvider);
 
-    return Material(
+    return RepaintBoundary(child: Material(
       color: Theme.of(context).colorScheme.surfaceContainerHigh,
       child: InkWell(
         onTap: () => _openPlayer(context),
@@ -103,7 +103,7 @@ class MiniPlayer extends ConsumerWidget {
           ),
         ),
       ),
-    );
+    ));
   }
 
   void _openPlayer(BuildContext context) {
@@ -146,15 +146,42 @@ class _MiniProgressBar extends ConsumerWidget {
   }
 }
 
-class _MiniPlayPauseButton extends ConsumerWidget {
+class _MiniPlayPauseButton extends ConsumerStatefulWidget {
   const _MiniPlayPauseButton();
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_MiniPlayPauseButton> createState() => _MiniPlayPauseButtonState();
+}
+
+class _MiniPlayPauseButtonState extends ConsumerState<_MiniPlayPauseButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _animCtrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 200),
+  );
+
+  @override
+  void dispose() {
+    _animCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final playing = ref.watch(progressProvider).valueOrNull?.playing ?? false;
     final handler = ref.read(audioHandlerProvider);
+
+    if (playing) {
+      _animCtrl.forward();
+    } else {
+      _animCtrl.reverse();
+    }
+
     return IconButton(
-      icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+      icon: AnimatedIcon(
+        icon: AnimatedIcons.play_pause,
+        progress: _animCtrl,
+      ),
       onPressed: playing ? handler.pause : handler.play,
     );
   }

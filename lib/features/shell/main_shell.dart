@@ -24,19 +24,22 @@ class MainShell extends ConsumerStatefulWidget {
 class _MainShellState extends ConsumerState<MainShell> {
   int _index = 0;
 
-  static final List<Widget> _pages = kIsWeb
-      ? const [
-          HomeScreen(),
-          SearchScreen(),
-          LibraryScreen(),
-          ProfileScreen(),
+  // Track which tabs have been visited to defer building until first visit.
+  final Set<int> _visited = {0};
+
+  static final List<Widget Function()> _pageBuilders = kIsWeb
+      ? [
+          () => const HomeScreen(),
+          () => const SearchScreen(),
+          () => const LibraryScreen(),
+          () => const ProfileScreen(),
         ]
-      : const [
-          HomeScreen(),
-          SearchScreen(),
-          BrowserScreen(),
-          LibraryScreen(),
-          ProfileScreen(),
+      : [
+          () => const HomeScreen(),
+          () => const SearchScreen(),
+          () => const BrowserScreen(),
+          () => const LibraryScreen(),
+          () => const ProfileScreen(),
         ];
 
   static final List<NavigationDestination> _destinations = kIsWeb
@@ -69,14 +72,24 @@ class _MainShellState extends ConsumerState<MainShell> {
     });
 
     return Scaffold(
-      body: IndexedStack(index: _index, children: _pages),
+      body: IndexedStack(
+        index: _index,
+        children: List.generate(_pageBuilders.length, (i) {
+          if (_visited.contains(i)) return _pageBuilders[i]();
+          return const SizedBox.shrink();
+        }),
+      ),
       bottomNavigationBar: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           const MiniPlayer(),
           NavigationBar(
+            animationDuration: const Duration(milliseconds: 400),
             selectedIndex: _index,
-            onDestinationSelected: (i) => setState(() => _index = i),
+            onDestinationSelected: (i) {
+              _visited.add(i);
+              setState(() => _index = i);
+            },
             destinations: _destinations,
           ),
         ],

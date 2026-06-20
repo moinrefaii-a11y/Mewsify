@@ -16,7 +16,6 @@ android {
 
     defaultConfig {
         applicationId = "com.example.melody"
-        // audio_service requires 21+, flutter_inappwebview prefers 23+.
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

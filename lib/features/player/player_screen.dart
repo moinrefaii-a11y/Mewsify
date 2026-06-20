@@ -443,29 +443,42 @@ class _ScrubberState extends ConsumerState<_Scrubber> {
   }
 }
 
-class _Transport extends ConsumerWidget {
+class _Transport extends ConsumerStatefulWidget {
   final bool playing;
   final MelodyAudioHandler handler;
   const _Transport({required this.playing, required this.handler});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_Transport> createState() => _TransportState();
+}
+
+class _TransportState extends ConsumerState<_Transport>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _playAnim = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 200),
+    value: widget.playing ? 1.0 : 0.0,
+  );
+
+  @override
+  void didUpdateWidget(covariant _Transport old) {
+    super.didUpdateWidget(old);
+    if (widget.playing != old.playing) {
+      widget.playing ? _playAnim.forward() : _playAnim.reverse();
+    }
+  }
+
+  @override
+  void dispose() {
+    _playAnim.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final shuffle = ref.watch(shuffleModeProvider).valueOrNull ?? false;
     final repeat = ref.watch(repeatModeProvider).valueOrNull ?? PlaybackRepeat.off;
-
-    // The YouTube embed in video mode owns its own play/pause UI, so
-    // we always drive the audio handler from this row. The handler is
-    // paused while video mode is on; toggling video off resumes it.
-    final effectivePlaying = playing;
-
-    void togglePlayPause() {
-      if (playing) {
-        handler.pause();
-      } else {
-        handler.play();
-      }
-    }
 
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -474,12 +487,12 @@ class _Transport extends ConsumerWidget {
           iconSize: 24,
           color: shuffle ? scheme.primary : null,
           icon: const Icon(Icons.shuffle),
-          onPressed: handler.toggleShuffle,
+          onPressed: widget.handler.toggleShuffle,
         ),
         IconButton(
           iconSize: 36,
           icon: const Icon(Icons.skip_previous),
-          onPressed: handler.skipToPrevious,
+          onPressed: widget.handler.skipToPrevious,
         ),
         Container(
           decoration: BoxDecoration(color: scheme.primary, shape: BoxShape.circle),
@@ -487,20 +500,25 @@ class _Transport extends ConsumerWidget {
           child: IconButton(
             iconSize: 38,
             color: scheme.onPrimary,
-            icon: Icon(effectivePlaying ? Icons.pause : Icons.play_arrow),
-            onPressed: togglePlayPause,
+            icon: AnimatedIcon(
+              icon: AnimatedIcons.play_pause,
+              progress: _playAnim,
+            ),
+            onPressed: () {
+              widget.playing ? widget.handler.pause() : widget.handler.play();
+            },
           ),
         ),
         IconButton(
           iconSize: 36,
           icon: const Icon(Icons.skip_next),
-          onPressed: handler.skipToNext,
+          onPressed: widget.handler.skipToNext,
         ),
         IconButton(
           iconSize: 24,
           color: repeat == PlaybackRepeat.off ? null : scheme.primary,
           icon: Icon(_repeatIcon(repeat)),
-          onPressed: handler.cycleRepeat,
+          onPressed: widget.handler.cycleRepeat,
         ),
       ],
     );

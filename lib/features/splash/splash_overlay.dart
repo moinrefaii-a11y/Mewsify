@@ -1,14 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_native_splash/flutter_native_splash.dart';
 
-/// Lean splash. The native splash already showed during cold start;
-/// this overlay only adds the brand wordmark + your credit and a
-/// short fade-out so we don't keep a heavy animated layer alive
-/// once the app is interactive.
+/// Premium splash overlay inspired by Spotify's clean approach.
 ///
-/// We deliberately avoid continuous CustomPaint animations here —
-/// they're cheap on real phones but visibly stutter on emulators.
-/// 1.6s total, then fades.
+/// Sequence (1.6s total):
+///   0–500ms   Logo scales + fades in
+///   300–650ms "MewSify" wordmark fades in
+///   550–850ms Credit line fades in
+///   850–1400ms Hold
+///   1400–1600ms Entire overlay fades out
+///
+/// No continuous CustomPaint loops — only standard Flutter transitions.
 class SplashOverlay extends StatefulWidget {
   final Widget child;
   const SplashOverlay({super.key, required this.child});
@@ -19,21 +21,45 @@ class SplashOverlay extends StatefulWidget {
 
 class _SplashOverlayState extends State<SplashOverlay>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl = AnimationController(
+  late final AnimationController _controller = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 1600),
   );
 
-  late final Animation<double> _logoScale = Tween<double>(begin: 0.92, end: 1.0)
-      .animate(CurvedAnimation(parent: _ctrl, curve: const Interval(0.0, 0.5, curve: Curves.easeOutCubic)));
-  late final Animation<double> _logoFade =
-      CurvedAnimation(parent: _ctrl, curve: const Interval(0.0, 0.35));
-  late final Animation<double> _wordFade =
-      CurvedAnimation(parent: _ctrl, curve: const Interval(0.30, 0.65));
-  late final Animation<double> _creditFade =
-      CurvedAnimation(parent: _ctrl, curve: const Interval(0.55, 0.85));
-  late final Animation<double> _exitFade = Tween<double>(begin: 1.0, end: 0.0)
-      .animate(CurvedAnimation(parent: _ctrl, curve: const Interval(0.85, 1.0, curve: Curves.easeOut)));
+  // Logo: scale from 0.85 → 1.0 and fade in over 0–500ms
+  late final Animation<double> _logoScale = Tween<double>(
+    begin: 0.85,
+    end: 1.0,
+  ).animate(CurvedAnimation(
+    parent: _controller,
+    curve: const Interval(0.0, 0.3125, curve: Curves.easeOutCubic),
+  ));
+
+  late final Animation<double> _logoOpacity = CurvedAnimation(
+    parent: _controller,
+    curve: const Interval(0.0, 0.3125, curve: Curves.easeOut),
+  );
+
+  // Wordmark: fade in over 300–650ms
+  late final Animation<double> _wordmarkOpacity = CurvedAnimation(
+    parent: _controller,
+    curve: const Interval(0.1875, 0.40625, curve: Curves.easeOut),
+  );
+
+  // Credit: fade in over 550–850ms
+  late final Animation<double> _creditOpacity = CurvedAnimation(
+    parent: _controller,
+    curve: const Interval(0.34375, 0.53125, curve: Curves.easeOut),
+  );
+
+  // Whole overlay fades out over 1400–1600ms
+  late final Animation<double> _overlayOpacity = Tween<double>(
+    begin: 1.0,
+    end: 0.0,
+  ).animate(CurvedAnimation(
+    parent: _controller,
+    curve: const Interval(0.875, 1.0, curve: Curves.easeOut),
+  ));
 
   bool _done = false;
 
@@ -43,218 +69,182 @@ class _SplashOverlayState extends State<SplashOverlay>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       FlutterNativeSplash.remove();
     });
-    _ctrl.forward().whenComplete(() {
+    _controller.forward().whenComplete(() {
       if (mounted) setState(() => _done = true);
     });
   }
 
   @override
   void dispose() {
-    _ctrl.dispose();
+    _controller.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     if (_done) return widget.child;
+
     return Stack(
       children: [
         widget.child,
-        AnimatedBuilder(
-          animation: _ctrl,
-          builder: (_, __) {
-            return IgnorePointer(
-              ignoring: _exitFade.value < 0.05,
-              child: Opacity(
-                opacity: _exitFade.value,
-                child: const _SplashScene(),
-              ),
-            );
-          },
-        ),
-        AnimatedBuilder(
-          animation: _ctrl,
-          builder: (_, __) {
-            if (_exitFade.value < 0.05) return const SizedBox.shrink();
-            return IgnorePointer(
-              child: Opacity(
-                opacity: _exitFade.value,
-                child: Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Spacer(flex: 5),
-                      // Logo: single transform per frame, no painter loop
-                      FadeTransition(
-                        opacity: _logoFade,
-                        child: ScaleTransition(
-                          scale: _logoScale,
-                          child: const _StaticLogo(),
-                        ),
-                      ),
-                      const SizedBox(height: 28),
-                      FadeTransition(
-                        opacity: _wordFade,
-                        child: const Text(
-                          'MewSify',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 30,
-                            fontWeight: FontWeight.w900,
-                            letterSpacing: -0.5,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      FadeTransition(
-                        opacity: _wordFade,
-                        child: const Text(
-                          'where the music meets you',
-                          style: TextStyle(
-                            color: Color(0xFF9DA2A8),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w500,
-                            letterSpacing: 0.4,
-                          ),
-                        ),
-                      ),
-                      const Spacer(flex: 7),
-                      FadeTransition(
-                        opacity: _creditFade,
-                        child: const _Credit(),
-                      ),
-                      const SizedBox(height: 32),
-                    ],
-                  ),
+        FadeTransition(
+          opacity: _overlayOpacity,
+          child: IgnorePointer(
+            child: Container(
+              width: double.infinity,
+              height: double.infinity,
+              decoration: const BoxDecoration(
+                gradient: RadialGradient(
+                  center: Alignment.center,
+                  radius: 1.2,
+                  colors: [Color(0xFF1A1E22), Color(0xFF060809)],
                 ),
               ),
-            );
-          },
+              child: Column(
+                children: [
+                  const Spacer(flex: 4),
+                  // Logo
+                  FadeTransition(
+                    opacity: _logoOpacity,
+                    child: ScaleTransition(
+                      scale: _logoScale,
+                      child: const _StaticLogo(),
+                    ),
+                  ),
+                  const SizedBox(height: 28),
+                  // Wordmark
+                  FadeTransition(
+                    opacity: _wordmarkOpacity,
+                    child: const Text(
+                      'MewSify',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 32,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: -0.5,
+                      ),
+                    ),
+                  ),
+                  const Spacer(flex: 5),
+                  // Credit
+                  FadeTransition(
+                    opacity: _creditOpacity,
+                    child: const _Credit(),
+                  ),
+                  const SizedBox(height: 48),
+                ],
+              ),
+            ),
+          ),
         ),
       ],
     );
   }
 }
 
-/// Static dark backdrop. No painter, just two-stop gradient.
-class _SplashScene extends StatelessWidget {
-  const _SplashScene();
-
-  @override
-  Widget build(BuildContext context) {
-    return const DecoratedBox(
-      decoration: BoxDecoration(
-        gradient: RadialGradient(
-          radius: 1.0,
-          colors: [Color(0xFF14181A), Color(0xFF050608)],
-        ),
-      ),
-      child: SizedBox.expand(),
-    );
-  }
-}
-
-/// Static logo tile — single gradient + a single SVG-style arrangement.
-/// Cheap to render: no animation, no painter tick.
+/// Static logo — green-to-teal gradient container with white bars
+/// painted once by a CustomPainter that never repaints.
 class _StaticLogo extends StatelessWidget {
   const _StaticLogo();
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 116,
-      height: 116,
+      width: 112,
+      height: 112,
       decoration: BoxDecoration(
         gradient: const LinearGradient(
           colors: [Color(0xFF1DE97C), Color(0xFF0AA0AF)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: BorderRadius.circular(24),
+        borderRadius: BorderRadius.circular(26),
         boxShadow: const [
           BoxShadow(
-            color: Color(0x551DE97C),
-            blurRadius: 32,
-            spreadRadius: -4,
-            offset: Offset(0, 14),
+            color: Color(0x401DE97C),
+            blurRadius: 40,
+            spreadRadius: -2,
+            offset: Offset(0, 16),
           ),
         ],
       ),
       child: Center(
         child: CustomPaint(
-          size: const Size(72, 72),
-          painter: _StaticBarsPainter(),
+          size: const Size(64, 64),
+          painter: const _BarsPainter(),
         ),
       ),
     );
   }
 }
 
-/// Single-pass painter — no animation tick, only paints once per build.
-class _StaticBarsPainter extends CustomPainter {
-  static const _heights = [0.45, 0.72, 0.95, 0.55, 0.95, 0.72, 0.45];
+/// Paints 7 white rounded bars at fixed heights. Never repaints.
+class _BarsPainter extends CustomPainter {
+  const _BarsPainter();
+
+  static const _heights = [0.40, 0.65, 0.90, 1.0, 0.90, 0.65, 0.40];
 
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()..color = Colors.white;
     const barCount = 7;
     final barWidth = size.width / (barCount * 2 - 1);
-    final spacing = barWidth;
+    final gap = barWidth;
+
     for (var i = 0; i < barCount; i++) {
       final h = _heights[i] * size.height;
-      final x = i * (barWidth + spacing);
+      final x = i * (barWidth + gap);
       final y = (size.height - h) / 2;
-      final rect = RRect.fromRectAndRadius(
-        Rect.fromLTWH(x, y, barWidth, h),
-        Radius.circular(barWidth / 2),
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(x, y, barWidth, h),
+          Radius.circular(barWidth / 2),
+        ),
+        paint,
       );
-      canvas.drawRRect(rect, paint);
     }
   }
 
   @override
-  bool shouldRepaint(_) => false;
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
+/// "Created with heart by MOIN" credit widget.
 class _Credit extends StatelessWidget {
   const _Credit();
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: const [
+    return const Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
         Text(
-          'Created with',
+          'Created with ',
           style: TextStyle(
-            color: Colors.white60,
-            fontSize: 11,
-            fontWeight: FontWeight.w500,
-            letterSpacing: 1.4,
+            color: Colors.white54,
+            fontSize: 13,
+            fontWeight: FontWeight.w400,
+            letterSpacing: 0.3,
           ),
         ),
-        SizedBox(height: 4),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text('❤️ ', style: TextStyle(fontSize: 16)),
-            Text(
-              'by ',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            Text(
-              'MOIN',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 17,
-                fontWeight: FontWeight.w900,
-                letterSpacing: 2.5,
-              ),
-            ),
-          ],
+        Text('❤️', style: TextStyle(fontSize: 14)),
+        Text(
+          ' by ',
+          style: TextStyle(
+            color: Colors.white54,
+            fontSize: 13,
+            fontWeight: FontWeight.w400,
+            letterSpacing: 0.3,
+          ),
+        ),
+        Text(
+          'MOIN',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 14,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 2.0,
+          ),
         ),
       ],
     );
