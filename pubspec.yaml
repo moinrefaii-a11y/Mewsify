@@ -47,8 +47,7 @@ dependencies:
   # Voice search (mic button → speech-to-text)
   speech_to_text: ^7.0.0
 
-  # Native video playback (for video mode in the player)
-  video_player: ^2.9.1
+
 
   # Image caching
   cached_network_image: ^3.3.1

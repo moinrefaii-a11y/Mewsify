@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:video_player/video_player.dart';
 
 import '../../core/providers.dart';
 import '../../data/models/track.dart';
@@ -14,6 +13,10 @@ import '../../widgets/track_artwork.dart';
 import 'queue_sheet.dart';
 import 'sleep_timer_sheet.dart';
 import 'video_view.dart';
+
+/// Last-known YouTube video position when video mode was active.
+/// Read by the toggle handler to seek the audio player on handoff.
+final _lastVideoPositionProvider = StateProvider<Duration>((_) => Duration.zero);
 
 /// Full-screen Now Playing UI: large artwork, title, scrubber, transport,
 /// and an extras row for sleep timer / queue.
@@ -46,23 +49,42 @@ class PlayerScreen extends ConsumerWidget {
                       _Header(
                         onMore: () => _showTrackMenu(context, ref, track),
                         videoMode: ref.watch(videoModeProvider),
-                        onToggleVideo: () {
+                        onToggleVideo: () async {
+                          final handler = ref.read(audioHandlerProvider);
                           final newMode = !ref.read(videoModeProvider);
-                          ref.read(videoModeProvider.notifier).state = newMode;
-                          // Tell the host activity so it can auto-PiP
-                          // when the user presses Home while video plays.
-                          PipService.instance.setVideoMode(newMode);
-                          // When leaving video mode, resume audio.
-                          if (!newMode) {
-                            ref.read(audioHandlerProvider).play();
+                          if (newMode) {
+                            // Entering video mode — pause audio cleanly.
+                            await handler.pause();
+                          } else {
+                            // Leaving video mode. The VideoView's
+                            // dispose() reports the last YouTube
+                            // position back through onPositionChange,
+                            // which we use to seek the audio handler.
+                            // The lastVideoPosition state is set
+                            // from there.
+                            final pos = ref.read(_lastVideoPositionProvider);
+                            if (pos > Duration.zero) {
+                              await handler.seek(pos);
+                            }
+                            await handler.play();
                           }
+                          ref.read(videoModeProvider.notifier).state = newMode;
+                          PipService.instance.setVideoMode(newMode);
                         },
                       ),
                       const SizedBox(height: 16),
                       Expanded(
                         child: Center(
                           child: ref.watch(videoModeProvider)
-                              ? VideoView(videoId: track.sourceVideoId)
+                              ? VideoView(
+                                  key: ValueKey(track.sourceVideoId),
+                                  videoId: track.sourceVideoId,
+                                  startAt: progressAsync.valueOrNull?.position ??
+                                      Duration.zero,
+                                  onPositionChange: (p) {
+                                    ref.read(_lastVideoPositionProvider.notifier).state = p;
+                                  },
+                                )
                               : AspectRatio(
                                   aspectRatio: 1,
                                   child: _Artwork(url: track.thumbnailUrl),
@@ -274,6 +296,7 @@ class _Artwork extends ConsumerWidget {
             ),
             child: TrackArtwork(
               url: url,
+              highRes: true,
               borderRadius: BorderRadius.circular(20),
             ),
           ),
@@ -353,37 +376,12 @@ class _ScrubberState extends ConsumerState<_Scrubber> {
   /// would snap back during the drag.
   double? _dragValue;
 
-  /// Polls the active video controller's position so the slider tracks
-  /// the actual video timeline (the audio handler is paused in video
-  /// mode so its position stream goes stale otherwise).
-  Stream<Duration>? _videoPositionStream(VideoPlayerController c) async* {
-    while (mounted) {
-      yield c.value.position;
-      await Future.delayed(const Duration(milliseconds: 250));
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
-    final videoController = ref.watch(videoControllerProvider);
-    final isVideoMode = videoController != null;
-
-    if (isVideoMode) {
-      return StreamBuilder<Duration>(
-        stream: _videoPositionStream(videoController),
-        builder: (context, snap) {
-          final pos = snap.data ?? videoController.value.position;
-          final dur = videoController.value.duration;
-          return _build(
-            pos: pos,
-            dur: dur,
-            onSeek: (p) {
-              videoController.seekTo(p);
-            },
-          );
-        },
-      );
-    }
+    // In video mode the YouTube embed handles its own scrubber and
+    // quality picker, so we hide ours to avoid confusion.
+    final videoMode = ref.watch(videoModeProvider);
+    if (videoMode) return const SizedBox(height: 24);
 
     final pos = widget.progress?.position ?? Duration.zero;
     final dur = widget.progress?.duration ?? Duration.zero;
@@ -456,28 +454,16 @@ class _Transport extends ConsumerWidget {
     final shuffle = ref.watch(shuffleModeProvider).valueOrNull ?? false;
     final repeat = ref.watch(repeatModeProvider).valueOrNull ?? PlaybackRepeat.off;
 
-    // When the user is in video mode, the play/pause button should
-    // reflect the *video player's* state (not the audio handler's,
-    // which we deliberately paused). Same for the click handler.
-    final videoController = ref.watch(videoControllerProvider);
-    final videoPlaying = ref.watch(videoPlayingProvider);
-    final isVideoMode = videoController != null;
-    final effectivePlaying = isVideoMode ? videoPlaying : playing;
+    // The YouTube embed in video mode owns its own play/pause UI, so
+    // we always drive the audio handler from this row. The handler is
+    // paused while video mode is on; toggling video off resumes it.
+    final effectivePlaying = playing;
 
     void togglePlayPause() {
-      if (isVideoMode) {
-        if (videoPlaying) {
-          videoController.pause();
-        } else {
-          videoController.play();
-        }
-        ref.read(videoPlayingProvider.notifier).state = !videoPlaying;
+      if (playing) {
+        handler.pause();
       } else {
-        if (playing) {
-          handler.pause();
-        } else {
-          handler.play();
-        }
+        handler.play();
       }
     }
 

@@ -6,28 +6,22 @@ import '../core/providers.dart';
 import '../features/player/player_screen.dart';
 
 /// Persistent strip above the bottom nav. Spotify-style gestures:
-///  - tap anywhere     → open full Now Playing
-///  - swipe up         → open full Now Playing (with slide-from-bottom anim)
+///  - tap anywhere       → open full Now Playing (slide-from-bottom)
+///  - swipe up           → open full Now Playing
 ///  - swipe left / right → next / previous track
-///  - tap play/pause   → toggle playback
-///  - tap skip         → next track
+///  - tap play/pause     → toggle playback
+///
+/// We split the progress bar and play/pause icon into separate
+/// ConsumerWidgets so frequent position events don't rebuild the
+/// whole row (smoothness win).
 class MiniPlayer extends ConsumerWidget {
   const MiniPlayer({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final trackAsync = ref.watch(currentTrackProvider);
-    final progressAsync = ref.watch(progressProvider);
-
-    final track = trackAsync.valueOrNull;
+    final track = ref.watch(currentTrackProvider).valueOrNull;
     if (track == null) return const SizedBox.shrink();
 
-    final progress = progressAsync.valueOrNull;
-    final percent = progress == null || progress.duration.inMilliseconds == 0
-        ? 0.0
-        : (progress.position.inMilliseconds / progress.duration.inMilliseconds)
-            .clamp(0.0, 1.0);
-    final playing = progress?.playing ?? false;
     final handler = ref.read(audioHandlerProvider);
 
     return Material(
@@ -36,10 +30,7 @@ class MiniPlayer extends ConsumerWidget {
         onTap: () => _openPlayer(context),
         child: GestureDetector(
           onVerticalDragEnd: (details) {
-            // Swipe up with enough velocity opens the full player.
-            if ((details.primaryVelocity ?? 0) < -250) {
-              _openPlayer(context);
-            }
+            if ((details.primaryVelocity ?? 0) < -250) _openPlayer(context);
           },
           onHorizontalDragEnd: (details) {
             final v = details.primaryVelocity ?? 0;
@@ -52,11 +43,7 @@ class MiniPlayer extends ConsumerWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              LinearProgressIndicator(
-                value: percent,
-                minHeight: 2,
-                backgroundColor: Colors.transparent,
-              ),
+              const _MiniProgressBar(),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 child: Row(
@@ -95,16 +82,16 @@ class MiniPlayer extends ConsumerWidget {
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               fontSize: 12,
-                              color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6),
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withValues(alpha: 0.6),
                             ),
                           ),
                         ],
                       ),
                     ),
-                    IconButton(
-                      icon: Icon(playing ? Icons.pause : Icons.play_arrow),
-                      onPressed: playing ? handler.pause : handler.play,
-                    ),
+                    const _MiniPlayPauseButton(),
                     IconButton(
                       icon: const Icon(Icons.skip_next),
                       onPressed: handler.skipToNext,
@@ -128,8 +115,6 @@ class MiniPlayer extends ConsumerWidget {
         reverseTransitionDuration: const Duration(milliseconds: 260),
         pageBuilder: (_, __, ___) => const PlayerScreen(),
         transitionsBuilder: (_, animation, __, child) {
-          // Slide from the bottom with a slight scale-up — feels like
-          // Spotify's mini-bar expanding into the full player.
           final offset = Tween<Offset>(
             begin: const Offset(0, 1),
             end: Offset.zero,
@@ -137,6 +122,40 @@ class MiniPlayer extends ConsumerWidget {
           return SlideTransition(position: offset, child: child);
         },
       ),
+    );
+  }
+}
+
+class _MiniProgressBar extends ConsumerWidget {
+  const _MiniProgressBar();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final progress = ref.watch(progressProvider).valueOrNull;
+    final percent = progress == null || progress.duration.inMilliseconds == 0
+        ? 0.0
+        : (progress.position.inMilliseconds / progress.duration.inMilliseconds)
+            .clamp(0.0, 1.0);
+    return RepaintBoundary(
+      child: LinearProgressIndicator(
+        value: percent,
+        minHeight: 2,
+        backgroundColor: Colors.transparent,
+      ),
+    );
+  }
+}
+
+class _MiniPlayPauseButton extends ConsumerWidget {
+  const _MiniPlayPauseButton();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final playing = ref.watch(progressProvider).valueOrNull?.playing ?? false;
+    final handler = ref.read(audioHandlerProvider);
+    return IconButton(
+      icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+      onPressed: playing ? handler.pause : handler.play,
     );
   }
 }

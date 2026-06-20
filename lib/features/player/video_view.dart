@@ -1,248 +1,125 @@
-import 'dart:io' show Platform;
-
 import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:video_player/video_player.dart';
 
 import '../../core/providers.dart';
-import '../../data/sources/youtube_source.dart';
-import 'fullscreen_video.dart';
 
-/// Renders the video stream of the currently playing track, kept in
-/// sync with the audio player so the visuals match the timeline.
+/// Video mode = embedded YouTube player.
 ///
-/// Tradeoff: when video mode is active, just_audio is paused and
-/// `video_player` becomes the source of truth (it has its own audio).
-/// When the user turns video mode off, we resume just_audio at the
-/// scrubbed position. This is a deliberate "two players, one timeline"
-/// pattern — avoids muxing DASH on the device.
+/// Why this approach instead of `video_player`:
+///   - YouTube's own embed handles every quality up to 4K; the
+///     `video_player` package can only mux 360p / 480p / 720p streams.
+///   - The embed exposes YouTube's native quality picker, captions,
+///     and full controls.
+///   - No DASH muxing, no two-player sync issues, no codec headaches.
+///
+/// The embed is started at the audio handler's current position so the
+/// switch from audio → video feels instant. While the WebView plays,
+/// the audio handler is paused. Switching back to audio mode resumes
+/// from the video's current position so the playback timeline never
+/// jumps backwards.
 class VideoView extends ConsumerStatefulWidget {
   final String videoId;
-  const VideoView({super.key, required this.videoId});
+  final Duration startAt;
+  final ValueChanged<Duration>? onPositionChange;
+
+  const VideoView({
+    super.key,
+    required this.videoId,
+    this.startAt = Duration.zero,
+    this.onPositionChange,
+  });
 
   @override
   ConsumerState<VideoView> createState() => _VideoViewState();
 }
 
 class _VideoViewState extends ConsumerState<VideoView> {
-  VideoPlayerController? _controller;
-  List<VideoStreamOption> _qualities = const [];
-  VideoStreamOption? _current;
-  bool _loading = true;
-  String? _error;
+  InAppWebViewController? _controller;
+  Duration _lastPosition = Duration.zero;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    // Mark video mode active so the player UI reads from this state.
+    Future.microtask(() {
+      if (mounted) {
+        ref.read(videoPlayingProvider.notifier).state = true;
+      }
+    });
   }
 
   @override
   void didUpdateWidget(covariant VideoView old) {
     super.didUpdateWidget(old);
     if (old.videoId != widget.videoId) {
-      _disposeController();
-      _load();
+      _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(_buildUrl())));
     }
   }
 
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final yt = ref.read(youtubeSourceProvider);
-      final qualities = await yt.resolveVideoStreams(widget.videoId);
-      if (qualities.isEmpty) {
-        throw 'No muxed video streams available for this track';
-      }
-      // Default to mid quality (480p-ish) for fast startup; user can
-      // bump to higher quality from the picker.
-      final initial = qualities.firstWhere(
-        (q) => q.height >= 480 && q.height <= 720,
-        orElse: () => qualities.first,
-      );
-      await _switchTo(initial, qualities);
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = e.toString();
-          _loading = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _switchTo(
-      VideoStreamOption option, List<VideoStreamOption> all) async {
-    // Pause audio while video plays — they'd otherwise double up.
-    await ref.read(audioHandlerProvider).pause();
-
-    final old = _controller;
-    final position = old?.value.position ?? Duration.zero;
-
-    final next = VideoPlayerController.networkUrl(
-      Uri.parse(option.url),
-      videoPlayerOptions: VideoPlayerOptions(
-        // iOS PiP: when supported, the system shows a floating
-        // mini-window with the video as the user backgrounds the app.
-        allowBackgroundPlayback: Platform.isIOS,
-      ),
-    );
-    await next.initialize();
-    await next.seekTo(position);
-    await next.play();
-
-    // Mirror playing state into a Riverpod provider so the player's
-    // transport row reflects the video's actual state (not the
-    // audio handler's, which is paused while video plays).
-    next.addListener(_publishVideoPlaying);
-
-    setState(() {
-      _controller = next;
-      _qualities = all;
-      _current = option;
-      _loading = false;
-    });
-
-    // Publish to Riverpod for the transport row to read.
-    ref.read(videoControllerProvider.notifier).state = next;
-    ref.read(videoPlayingProvider.notifier).state = true;
-
-    if (old != null) {
-      old.removeListener(_publishVideoPlaying);
-      await old.dispose();
-    }
-  }
-
-  void _publishVideoPlaying() {
-    final c = _controller;
-    if (c == null) return;
-    ref.read(videoPlayingProvider.notifier).state = c.value.isPlaying;
-  }
-
-  void _disposeController() {
-    _controller?.removeListener(_publishVideoPlaying);
-    _controller?.dispose();
-    _controller = null;
-    // Clear the Riverpod state so the transport row stops trying to
-    // drive a disposed controller.
-    if (ref.read(videoControllerProvider) != null) {
-      ref.read(videoControllerProvider.notifier).state = null;
-      ref.read(videoPlayingProvider.notifier).state = false;
-    }
+  String _buildUrl() {
+    // Embed parameters keep the player chrome minimal and skip the
+    // "watch on YouTube" splash.
+    final start = widget.startAt.inSeconds;
+    return 'https://www.youtube.com/embed/${widget.videoId}'
+        '?autoplay=1&playsinline=1&fs=1&modestbranding=1'
+        '&rel=0&iv_load_policy=3&start=$start';
   }
 
   @override
   void dispose() {
-    _disposeController();
+    // Surface the last known position so the parent can sync the audio
+    // handler to wherever the video was when the user left video mode.
+    widget.onPositionChange?.call(_lastPosition);
+    final notifier = ref.read(videoPlayingProvider.notifier);
+    notifier.state = false;
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return const AspectRatio(
-        aspectRatio: 16 / 9,
-        child: Center(child: CircularProgressIndicator()),
-      );
-    }
-    if (_error != null) {
-      return AspectRatio(
-        aspectRatio: 16 / 9,
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Text(
-              _error!,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.65),
-              ),
-            ),
-          ),
-        ),
-      );
-    }
-    final c = _controller!;
     return AspectRatio(
-      aspectRatio: c.value.aspectRatio == 0 ? 16 / 9 : c.value.aspectRatio,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          GestureDetector(
-            onTap: () {
-              c.value.isPlaying ? c.pause() : c.play();
-              setState(() {});
-            },
-            child: VideoPlayer(c),
+      aspectRatio: 16 / 9,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: InAppWebView(
+          initialUrlRequest: URLRequest(url: WebUri(_buildUrl())),
+          initialSettings: InAppWebViewSettings(
+            mediaPlaybackRequiresUserGesture: false,
+            allowsInlineMediaPlayback: true,
+            iframeAllowFullscreen: true,
+            transparentBackground: true,
+            useShouldOverrideUrlLoading: true,
           ),
-          // Fullscreen button (bottom-right)
-          Positioned(
-            bottom: 8,
-            right: 8,
-            child: IconButton(
-              tooltip: 'Fullscreen',
-              icon: Container(
-                padding: const EdgeInsets.all(6),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.55),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: const Icon(Icons.fullscreen, color: Colors.white, size: 18),
-              ),
-              onPressed: () {
-                Navigator.of(context).push(MaterialPageRoute(
-                  builder: (_) => FullscreenVideo(controller: c),
-                ));
+          onWebViewCreated: (controller) {
+            _controller = controller;
+            controller.addJavaScriptHandler(
+              handlerName: 'onTime',
+              callback: (args) {
+                if (args.isNotEmpty && args.first is num) {
+                  _lastPosition = Duration(milliseconds: ((args.first as num) * 1000).round());
+                }
+                return null;
               },
-            ),
-          ),
-
-          // Quality picker overlay top-right
-          Positioned(
-            top: 8,
-            right: 8,
-            child: PopupMenuButton<VideoStreamOption>(
-              tooltip: 'Quality',
-              icon: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.55),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.high_quality_rounded, color: Colors.white, size: 16),
-                    const SizedBox(width: 4),
-                    Text(
-                      _current?.qualityLabel ?? 'auto',
-                      style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w700),
-                    ),
-                  ],
-                ),
-              ),
-              onSelected: (opt) => _switchTo(opt, _qualities),
-              itemBuilder: (_) => _qualities
-                  .map((q) => PopupMenuItem(
-                        value: q,
-                        child: Row(
-                          children: [
-                            if (_current == q)
-                              const Icon(Icons.check, size: 18)
-                            else
-                              const SizedBox(width: 18),
-                            const SizedBox(width: 8),
-                            Text(q.qualityLabel),
-                          ],
-                        ),
-                      ))
-                  .toList(),
-            ),
-          ),
-        ],
+            );
+          },
+          onLoadStop: (controller, _) async {
+            // Inject a tiny script that polls the YouTube iframe API
+            // and pings Dart with the current playback time. We use
+            // this to sync audio-mode handoff and the scrubber UI.
+            await controller.evaluateJavascript(source: '''
+              (function() {
+                if (window.__mewsifyTimer) return;
+                window.__mewsifyTimer = setInterval(function() {
+                  var v = document.querySelector('video');
+                  if (v) {
+                    window.flutter_inappwebview.callHandler('onTime', v.currentTime || 0);
+                  }
+                }, 500);
+              })();
+            ''');
+          },
+        ),
       ),
     );
   }

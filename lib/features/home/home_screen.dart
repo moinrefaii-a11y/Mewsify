@@ -14,7 +14,10 @@ class HomeScreen extends ConsumerWidget {
   const HomeScreen({super.key});
 
   /// All curated home feeds. Each one fires a YouTube search behind a
-  /// FutureProvider.family and renders as a horizontal carousel.
+  /// FutureProvider.family and renders as a horizontal carousel. The
+  /// list builds lazily — `SliverList.builder` only spins up a
+  /// _CategoryFeed (and its network fetch) when the user scrolls it
+  /// into view. No 10-parallel-search storm at app start.
   static const _feeds = <_Feed>[
     _Feed('Bollywood hits', 'bollywood new songs 2026'),
     _Feed('Hindi top tracks', 'hindi songs 2026'),
@@ -111,10 +114,16 @@ class HomeScreen extends ConsumerWidget {
             ),
 
             // Curated language / category rows (Bollywood, Telugu, Tamil, Podcasts...)
-            for (final feed in _feeds)
-              SliverToBoxAdapter(
-                child: _CategoryFeed(feed: feed, currentTrackId: currentTrack?.id),
+            // SliverList.builder only constructs visible children, so
+            // the network calls happen as the user scrolls — no
+            // 10-search burst at app launch.
+            SliverList.builder(
+              itemCount: _feeds.length,
+              itemBuilder: (_, i) => _CategoryFeed(
+                feed: _feeds[i],
+                currentTrackId: currentTrack?.id,
               ),
+            ),
 
             // Trending
             const SliverToBoxAdapter(child: _SectionHeader('Trending now')),

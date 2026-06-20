@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
-import 'package:video_player/video_player.dart';
 
 import '../data/models/track.dart';
 import '../data/repositories/library_repository.dart';
@@ -115,16 +114,9 @@ final playerErrorProvider = StreamProvider<String?>((ref) {
 /// (true) or just the album art (false). Defaults to "photo" mode.
 final videoModeProvider = StateProvider<bool>((ref) => false);
 
-/// The currently active VideoPlayerController, set by VideoView when
-/// video mode is on. Null in audio mode. Wired up so the player's
-/// transport row can drive playback against whichever player is
-/// currently "primary".
-final videoControllerProvider = StateProvider<VideoPlayerController?>(
-  (ref) => null,
-);
-
-/// Whether the active video controller is currently playing. Updates
-/// via a periodic listener wired in VideoView.
+/// True when the YouTube embed in video mode is currently playing.
+/// (We dropped video_player in favor of a YouTube embed for true HD
+/// playback. The embed is a black box — we just track on/off here.)
 final videoPlayingProvider = StateProvider<bool>((ref) => false);
 
 /// Reactive shuffle mode for the player UI.

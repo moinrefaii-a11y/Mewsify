@@ -25,14 +25,15 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _init();
   }
 
-  /// Two AudioPlayer instances used in alternation for the two-player
-  /// crossfade. No audio pipeline / effects — keeps the player rock-
-  /// solid across all Android OEMs.
+  /// Primary player. The secondary one (`_b`) is only created the
+  /// first time we actually need to crossfade — most users keep
+  /// crossfade off, and an idle AudioPlayer still costs CPU + memory.
   late final AudioPlayer _a = AudioPlayer();
-  late final AudioPlayer _b = AudioPlayer();
+  AudioPlayer? _bLazy;
+  AudioPlayer get _b => _bLazy ??= AudioPlayer();
 
   late AudioPlayer _player; // foreground player; UI listens to this
-  AudioPlayer get _other => identical(_player, _a) ? _b : _a;
+  AudioPlayer get _other => identical(_player, _a) ? _b : _a; // lazy-allocates _b
 
   /// Listener subscriptions on the active player. Re-bound after every
   /// crossfade swap so events keep flowing to audio_service / UI.
@@ -74,6 +75,8 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _eventSub?.cancel();
     _stateSub?.cancel();
     _indexSub?.cancel();
+
+    _bindProgress();
 
     _eventSub = _player.playbackEventStream.listen(
       _broadcastState,
@@ -189,11 +192,13 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
   /// Watchdog: every second, check if we're inside the crossfade window
   /// of the currently-playing track. If so, kick off the overlap.
+  /// We don't even start a Timer when crossfade is off (default) so
+  /// the audio handler is idle outside of actual playback events.
   void _scheduleCrossfade() {
     _crossfadeWatchdog?.cancel();
     final seconds = _crossfadeSeconds();
     if (seconds <= 0) return;
-    _crossfadeWatchdog = Timer.periodic(const Duration(milliseconds: 500), (_) {
+    _crossfadeWatchdog = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_crossfading) return;
       final dur = _player.duration;
       final pos = _player.position;
@@ -373,13 +378,21 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   @override
   Future<void> stop() async {
     await _player.stop();
-    await _other.stop();
+    if (_bLazy != null) await _bLazy!.stop();
     await super.stop();
   }
 
   @override
   Future<void> skipToNext() async {
-    final next = _peekNextIndex();
+    var next = _peekNextIndex();
+    // If the user just kicked off playWithAutoplay, the related-tracks
+    // background fetch may not have completed yet. When that happens
+    // we eagerly fill the queue here so the lock-screen Next button
+    // never becomes a no-op.
+    if (next == null && _queue.isNotEmpty) {
+      await _appendRelatedToQueue(_queue.last.sourceVideoId);
+      next = _peekNextIndex();
+    }
     if (next != null) await _playIndex(next);
   }
 
@@ -473,24 +486,55 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   List<Track> get currentQueue => List.unmodifiable(_queue);
   int get currentIndex => _currentIndex;
 
-  /// Combined progress stream that always reflects the *active* player
-  /// even after a crossfade swap.
-  Stream<ProgressData> get progressStream {
-    return Rx.combineLatest3<Duration, Duration?, bool, ProgressData>(
-      // We can't statically subscribe to "the currently active player"
-      // since `_player` is mutable, so we emit a stream that sources
-      // from both players merged. The active player's events dominate
-      // because the inactive one is paused or muted.
-      Rx.merge([_a.positionStream, _b.positionStream]),
-      Rx.merge([_a.durationStream, _b.durationStream]),
-      Rx.merge([_a.playingStream, _b.playingStream]),
-      (pos, dur, playing) => ProgressData(
+  /// Progress stream emitted by whichever player is currently active.
+  /// We use the broadcast subject below so a swap (post-crossfade)
+  /// rebinds without leaking stale positions from the inactive player.
+  final BehaviorSubject<ProgressData> _progressSubject =
+      BehaviorSubject<ProgressData>.seeded(
+    const ProgressData(
+      position: Duration.zero,
+      duration: Duration.zero,
+      playing: false,
+    ),
+  );
+
+  StreamSubscription? _progressPosSub;
+  StreamSubscription? _progressDurSub;
+  StreamSubscription? _progressPlaySub;
+
+  void _bindProgress() {
+    _progressPosSub?.cancel();
+    _progressDurSub?.cancel();
+    _progressPlaySub?.cancel();
+
+    Duration pos = _player.position;
+    Duration? dur = _player.duration;
+    bool playing = _player.playing;
+
+    void emit() {
+      _progressSubject.add(ProgressData(
         position: pos,
         duration: dur ?? Duration.zero,
         playing: playing,
-      ),
-    );
+      ));
+    }
+
+    _progressPosSub = _player.positionStream.listen((p) {
+      pos = p;
+      emit();
+    });
+    _progressDurSub = _player.durationStream.listen((d) {
+      dur = d;
+      emit();
+    });
+    _progressPlaySub = _player.playingStream.listen((p) {
+      playing = p;
+      emit();
+    });
+    emit();
   }
+
+  Stream<ProgressData> get progressStream => _progressSubject.stream;
 
   Track? get currentTrack =>
       _currentIndex >= 0 && _currentIndex < _queue.length ? _queue[_currentIndex] : null;
