@@ -152,12 +152,10 @@ class PipedSource {
           ? (ownerRuns.first['text']?.toString() ?? 'Unknown')
           : 'Unknown';
 
-      // Best (last) thumbnail
-      String thumb = 'https://i.ytimg.com/vi/$videoId/hqdefault.jpg';
-      final thumbs = (v['thumbnail']?['thumbnails']) as List?;
-      if (thumbs != null && thumbs.isNotEmpty) {
-        thumb = (thumbs.last as Map)['url']?.toString() ?? thumb;
-      }
+      // Use hq720.jpg — server-rendered 1280x720, exists for every
+      // YouTube video. The InnerTube response only includes 320x180
+      // thumbnails for search results which look blurry at full width.
+      final thumb = 'https://i.ytimg.com/vi/$videoId/hq720.jpg';
 
       // Duration: "3:45" or "1:02:30"
       final durStr = v['lengthText']?['simpleText']?.toString() ?? '';
@@ -272,12 +270,19 @@ class PipedSource {
         }
       }
 
-      String thumb = 'https://i.ytimg.com/vi/$videoId/hqdefault.jpg';
+      String thumb = 'https://i.ytimg.com/vi/$videoId/hq720.jpg';
       final thumbnails = (((item['thumbnail'] as Map?)?['musicThumbnailRenderer']
                   as Map?)?['thumbnail'] as Map?)?['thumbnails'] as List?;
       if (thumbnails != null && thumbnails.isNotEmpty) {
         final last = thumbnails.last as Map<String, dynamic>;
-        thumb = last['url']?.toString() ?? thumb;
+        final raw = last['url']?.toString() ?? thumb;
+        // YouTube Music album art comes from lh3.googleusercontent.com
+        // with a size suffix like "=w120-h120-l90-rj". Rewrite to a
+        // much larger size so the player artwork looks crisp.
+        thumb = raw.replaceFirstMapped(
+          RegExp(r'=w\d+-h\d+'),
+          (_) => '=w1080-h1080',
+        );
       }
 
       return Track(

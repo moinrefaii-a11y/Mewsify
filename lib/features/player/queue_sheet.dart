@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers.dart';
+import '../../widgets/eq_indicator.dart';
 import '../../widgets/track_tile.dart';
 
 /// "Up next" queue sheet. Reorder + remove are shown via an icon column;
@@ -63,8 +64,10 @@ class _QueueSheetState extends ConsumerState<QueueSheet> {
                           track: t,
                           onTap: () => handler.skipToQueueItem(i),
                           trailing: isCurrent
-                              ? Icon(Icons.equalizer,
-                                  color: Theme.of(context).colorScheme.primary)
+                              ? EqIndicator(
+                                  size: 22,
+                                  color: Theme.of(context).colorScheme.primary,
+                                )
                               : IconButton(
                                   icon: const Icon(Icons.close, size: 18),
                                   onPressed: () async {

@@ -2,12 +2,15 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:video_player/video_player.dart';
 
 import '../../core/providers.dart';
 import '../../data/models/track.dart';
 import '../../services/audio_handler.dart';
 import '../../services/palette_service.dart';
 import '../../services/pip_service.dart';
+import '../../widgets/track_artwork.dart';
 import 'queue_sheet.dart';
 import 'sleep_timer_sheet.dart';
 import 'video_view.dart';
@@ -140,7 +143,18 @@ class PlayerScreen extends ConsumerWidget {
             ListTile(
               leading: const Icon(Icons.share),
               title: const Text('Share'),
-              onTap: () => Navigator.pop(context),
+              onTap: () async {
+                Navigator.pop(context);
+                final url = 'https://youtu.be/${track.sourceVideoId}';
+                final body =
+                    '🎵 Listen to "${track.title}" by ${track.artist}\n\nOn MewSify  •  $url';
+                await SharePlus.instance.share(
+                  ShareParams(
+                    text: body,
+                    subject: '${track.title} — ${track.artist}',
+                  ),
+                );
+              },
             ),
           ],
         ),
@@ -225,31 +239,43 @@ class _Header extends StatelessWidget {
   }
 }
 
-class _Artwork extends StatelessWidget {
+/// Now Playing artwork with horizontal swipe-to-skip support and a
+/// Hero tag for the smooth transition from the mini player.
+class _Artwork extends ConsumerWidget {
   final String url;
   const _Artwork({required this.url});
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.4),
-            blurRadius: 30,
-            offset: const Offset(0, 12),
-          ),
-        ],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(20),
-        child: CachedNetworkImage(
-          imageUrl: url,
-          fit: BoxFit.cover,
-          errorWidget: (_, __, ___) => Container(
-            color: Theme.of(context).colorScheme.surfaceContainerHighest,
-            child: const Icon(Icons.music_note, size: 80),
+  Widget build(BuildContext context, WidgetRef ref) {
+    final handler = ref.read(audioHandlerProvider);
+    return GestureDetector(
+      onHorizontalDragEnd: (details) {
+        final v = details.primaryVelocity ?? 0;
+        if (v < -250) {
+          handler.skipToNext();
+        } else if (v > 250) {
+          handler.skipToPrevious();
+        }
+      },
+      child: Hero(
+        tag: 'now-playing-art',
+        child: Material(
+          type: MaterialType.transparency,
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.4),
+                  blurRadius: 30,
+                  offset: const Offset(0, 12),
+                ),
+              ],
+            ),
+            child: TrackArtwork(
+              url: url,
+              borderRadius: BorderRadius.circular(20),
+            ),
           ),
         ),
       ),
@@ -312,31 +338,98 @@ class _TitleBlock extends ConsumerWidget {
   }
 }
 
-class _Scrubber extends StatelessWidget {
+class _Scrubber extends ConsumerStatefulWidget {
   final ProgressData? progress;
   final ValueChanged<Duration> onSeek;
   const _Scrubber({required this.progress, required this.onSeek});
 
   @override
+  ConsumerState<_Scrubber> createState() => _ScrubberState();
+}
+
+class _ScrubberState extends ConsumerState<_Scrubber> {
+  /// Local position used while the user is actively dragging — the
+  /// real player won't have caught up yet, so without this the thumb
+  /// would snap back during the drag.
+  double? _dragValue;
+
+  /// Polls the active video controller's position so the slider tracks
+  /// the actual video timeline (the audio handler is paused in video
+  /// mode so its position stream goes stale otherwise).
+  Stream<Duration>? _videoPositionStream(VideoPlayerController c) async* {
+    while (mounted) {
+      yield c.value.position;
+      await Future.delayed(const Duration(milliseconds: 250));
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final pos = progress?.position ?? Duration.zero;
-    final dur = progress?.duration ?? Duration.zero;
-    final value = dur.inMilliseconds == 0
+    final videoController = ref.watch(videoControllerProvider);
+    final isVideoMode = videoController != null;
+
+    if (isVideoMode) {
+      return StreamBuilder<Duration>(
+        stream: _videoPositionStream(videoController),
+        builder: (context, snap) {
+          final pos = snap.data ?? videoController.value.position;
+          final dur = videoController.value.duration;
+          return _build(
+            pos: pos,
+            dur: dur,
+            onSeek: (p) {
+              videoController.seekTo(p);
+            },
+          );
+        },
+      );
+    }
+
+    final pos = widget.progress?.position ?? Duration.zero;
+    final dur = widget.progress?.duration ?? Duration.zero;
+    return _build(pos: pos, dur: dur, onSeek: widget.onSeek);
+  }
+
+  Widget _build({
+    required Duration pos,
+    required Duration dur,
+    required ValueChanged<Duration> onSeek,
+  }) {
+    final actualValue = dur.inMilliseconds == 0
         ? 0.0
         : (pos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0);
+    final value = _dragValue ?? actualValue;
+    final displayPos = _dragValue == null
+        ? pos
+        : Duration(milliseconds: (_dragValue! * dur.inMilliseconds).round());
 
     return Column(
       children: [
-        Slider(
-          value: value,
-          onChanged: (v) => onSeek(Duration(milliseconds: (v * dur.inMilliseconds).round())),
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 3,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+          ),
+          child: Slider(
+            value: value,
+            onChanged: (v) => setState(() => _dragValue = v),
+            onChangeEnd: (v) {
+              final target = Duration(milliseconds: (v * dur.inMilliseconds).round());
+              onSeek(target);
+              // Hold the drag value briefly so the thumb doesn't snap
+              // back before the player reports the new position.
+              Future.delayed(const Duration(milliseconds: 250), () {
+                if (mounted) setState(() => _dragValue = null);
+              });
+            },
+          ),
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 4),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(_fmt(pos), style: const TextStyle(fontSize: 12)),
+              Text(_fmt(displayPos), style: const TextStyle(fontSize: 12)),
               Text(_fmt(dur), style: const TextStyle(fontSize: 12)),
             ],
           ),
@@ -363,6 +456,31 @@ class _Transport extends ConsumerWidget {
     final shuffle = ref.watch(shuffleModeProvider).valueOrNull ?? false;
     final repeat = ref.watch(repeatModeProvider).valueOrNull ?? PlaybackRepeat.off;
 
+    // When the user is in video mode, the play/pause button should
+    // reflect the *video player's* state (not the audio handler's,
+    // which we deliberately paused). Same for the click handler.
+    final videoController = ref.watch(videoControllerProvider);
+    final videoPlaying = ref.watch(videoPlayingProvider);
+    final isVideoMode = videoController != null;
+    final effectivePlaying = isVideoMode ? videoPlaying : playing;
+
+    void togglePlayPause() {
+      if (isVideoMode) {
+        if (videoPlaying) {
+          videoController.pause();
+        } else {
+          videoController.play();
+        }
+        ref.read(videoPlayingProvider.notifier).state = !videoPlaying;
+      } else {
+        if (playing) {
+          handler.pause();
+        } else {
+          handler.play();
+        }
+      }
+    }
+
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
@@ -383,8 +501,8 @@ class _Transport extends ConsumerWidget {
           child: IconButton(
             iconSize: 38,
             color: scheme.onPrimary,
-            icon: Icon(playing ? Icons.pause : Icons.play_arrow),
-            onPressed: playing ? handler.pause : handler.play,
+            icon: Icon(effectivePlaying ? Icons.pause : Icons.play_arrow),
+            onPressed: togglePlayPause,
           ),
         ),
         IconButton(

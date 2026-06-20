@@ -71,7 +71,7 @@ class ProfileScreen extends ConsumerWidget {
                 child: ListTile(
                   leading: const Icon(Icons.tune_rounded),
                   title: const Text('App settings'),
-                  subtitle: const Text('Theme, equalizer, crossfade and more'),
+                  subtitle: const Text('Theme, crossfade, sleep timer and more'),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: () => Navigator.of(context).push(
                     MaterialPageRoute(

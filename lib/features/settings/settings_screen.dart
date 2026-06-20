@@ -7,7 +7,6 @@ import 'package:hive_flutter/hive_flutter.dart';
 import '../../core/providers.dart';
 import '../../core/theme.dart';
 import '../player/sleep_timer_sheet.dart';
-import 'equalizer_screen.dart';
 
 bool get _isAndroid => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
@@ -47,16 +46,6 @@ class SettingsScreen extends ConsumerWidget {
             ),
           ),
           _CrossfadeTile(),
-          ListTile(
-            leading: const Icon(Icons.equalizer),
-            title: const Text('Equalizer'),
-            subtitle: Text(_isAndroid ? '10-band Android equalizer' : 'Limited on this platform'),
-            trailing: const Icon(Icons.chevron_right),
-            onTap: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const EqualizerScreen()),
-            ),
-          ),
           if (_isAndroid)
             ListTile(
               leading: const Icon(Icons.picture_in_picture_alt_outlined),

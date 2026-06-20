@@ -1,7 +1,9 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../data/models/track.dart';
+import '../services/palette_service.dart';
+import 'eq_indicator.dart';
+import 'track_artwork.dart';
 
 /// Reusable track row. Two visual styles:
 ///  - compact (default) for queue / library / horizontal carousels
@@ -42,15 +44,11 @@ class TrackTile extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         child: Row(
           children: [
-            ClipRRect(
+            TrackArtwork(
+              url: track.thumbnailUrl,
+              width: 52,
+              height: 52,
               borderRadius: BorderRadius.circular(8),
-              child: CachedNetworkImage(
-                imageUrl: track.thumbnailUrl,
-                width: 52,
-                height: 52,
-                fit: BoxFit.cover,
-                errorWidget: (_, __, ___) => _placeholder(context, 52, 52),
-              ),
             ),
             const SizedBox(width: 12),
             Expanded(child: _meta(context)),
@@ -64,14 +62,38 @@ class TrackTile extends StatelessWidget {
   }
 
   Widget _wideLayout(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      onLongPress: onLongPress,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+    final scheme = Theme.of(context).colorScheme;
+    return FutureBuilder<MelodyPalette>(
+      future: PaletteService.instance.getPalette(track.thumbnailUrl),
+      builder: (context, snap) {
+        // Soft horizontal gradient tinted with the artwork's dominant
+        // colour. Only paints once palette is resolved so first paint
+        // doesn't flash a wrong color.
+        final tint = snap.data?.primary;
+        return Container(
+          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            gradient: tint == null
+                ? null
+                : LinearGradient(
+                    begin: Alignment.centerLeft,
+                    end: Alignment.centerRight,
+                    colors: [
+                      tint.withValues(alpha: 0.22),
+                      scheme.surface.withValues(alpha: 0.0),
+                    ],
+                  ),
+          ),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: onTap,
+            onLongPress: onLongPress,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
             // 16:9 thumbnail like YouTube. Stack a duration pill in the
             // bottom-right corner.
             ClipRRect(
@@ -83,11 +105,7 @@ class TrackTile extends StatelessWidget {
                   child: Stack(
                     children: [
                       Positioned.fill(
-                        child: CachedNetworkImage(
-                          imageUrl: track.thumbnailUrl,
-                          fit: BoxFit.cover,
-                          errorWidget: (_, __, ___) => _placeholder(context, 0, 0),
-                        ),
+                        child: TrackArtwork(url: track.thumbnailUrl),
                       ),
                       Positioned(
                         right: 6,
@@ -113,10 +131,9 @@ class TrackTile extends StatelessWidget {
                           child: Container(
                             color: Colors.black.withValues(alpha: 0.45),
                             child: Center(
-                              child: Icon(
-                                Icons.equalizer,
+                              child: EqIndicator(
+                                size: 28,
                                 color: Theme.of(context).colorScheme.primary,
-                                size: 32,
                               ),
                             ),
                           ),
@@ -165,9 +182,12 @@ class TrackTile extends StatelessWidget {
                 icon: const Icon(Icons.more_vert, size: 20),
                 onPressed: onMore,
               ),
-          ],
-        ),
-      ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -198,13 +218,6 @@ class TrackTile extends StatelessWidget {
       ],
     );
   }
-
-  Widget _placeholder(BuildContext context, double w, double h) => Container(
-        width: w == 0 ? null : w,
-        height: h == 0 ? null : h,
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-        child: const Icon(Icons.music_note),
-      );
 
   String _fmt(Duration d) {
     final m = d.inMinutes;

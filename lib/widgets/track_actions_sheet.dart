@@ -2,6 +2,8 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:share_plus/share_plus.dart';
+
 import '../core/providers.dart';
 import '../data/models/track.dart';
 import '../features/artist/artist_screen.dart';
@@ -103,6 +105,14 @@ class TrackActionsSheet extends ConsumerWidget {
             },
           ),
           ListTile(
+            leading: const Icon(Icons.playlist_add_rounded),
+            title: const Text('Add to playlist'),
+            onTap: () async {
+              Navigator.pop(context);
+              await _showPickPlaylist(context, ref, track);
+            },
+          ),
+          ListTile(
             leading: const Icon(Icons.radio_rounded),
             title: const Text('Start radio'),
             subtitle: const Text('Endless queue of related tracks'),
@@ -138,11 +148,119 @@ class TrackActionsSheet extends ConsumerWidget {
           ListTile(
             leading: const Icon(Icons.share_outlined),
             title: const Text('Share'),
-            onTap: () => Navigator.pop(context),
+            onTap: () async {
+              Navigator.pop(context);
+              await _shareTrack(track);
+            },
           ),
           const SizedBox(height: 8),
         ],
       ),
     );
   }
+}
+
+
+/// Build a Spotify-style share message and pass it to the OS share sheet.
+/// We include the YouTube URL as the canonical link — it works for
+/// everyone (opens in YouTube / browser if the recipient doesn't have
+/// MewSify, and the MewSify intent filter intercepts it if they do).
+Future<void> _shareTrack(Track track) async {
+  final url = 'https://youtu.be/${track.sourceVideoId}';
+  final body = '🎵 Listen to "${track.title}" by ${track.artist}\n\n'
+      'On MewSify  •  $url';
+  await SharePlus.instance.share(
+    ShareParams(text: body, subject: '${track.title} — ${track.artist}'),
+  );
+}
+
+
+/// Bottom sheet that lists existing playlists + a "New playlist" entry
+/// at the top. Tapping a playlist drops the track into it.
+Future<void> _showPickPlaylist(
+    BuildContext context, WidgetRef ref, Track track) async {
+  final library = ref.read(libraryProvider);
+  await showModalBottomSheet(
+    context: context,
+    isScrollControlled: true,
+    builder: (sheetContext) {
+      return SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Text(
+                'Add to playlist',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.add_rounded),
+              title: const Text('New playlist'),
+              onTap: () async {
+                Navigator.pop(sheetContext);
+                final controller = TextEditingController();
+                final name = await showDialog<String>(
+                  context: context,
+                  builder: (_) => AlertDialog(
+                    title: const Text('New playlist'),
+                    content: TextField(
+                      controller: controller,
+                      autofocus: true,
+                      decoration: const InputDecoration(hintText: 'Playlist name'),
+                    ),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('Cancel')),
+                      FilledButton(
+                          onPressed: () => Navigator.pop(context, controller.text),
+                          child: const Text('Create')),
+                    ],
+                  ),
+                );
+                if (name != null && name.trim().isNotEmpty) {
+                  final pl = await library.createPlaylist(name);
+                  await library.addTrackToPlaylist(pl.id, track);
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Added to "${pl.name}"')),
+                    );
+                  }
+                }
+              },
+            ),
+            const Divider(height: 1),
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(
+                  children: [
+                    for (final p in library.playlists)
+                      ListTile(
+                        leading: const Icon(Icons.queue_music_rounded),
+                        title: Text(p.name),
+                        subtitle: Text(
+                          '${p.tracks.length} ${p.tracks.length == 1 ? "track" : "tracks"}',
+                        ),
+                        onTap: () async {
+                          Navigator.pop(sheetContext);
+                          await library.addTrackToPlaylist(p.id, track);
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('Added to "${p.name}"')),
+                            );
+                          }
+                        },
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+        ),
+      );
+    },
+  );
 }

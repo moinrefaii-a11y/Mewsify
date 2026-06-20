@@ -15,6 +15,16 @@
     <!-- Floating popup player overlay. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
 
+    <!-- Voice search (mic). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+
+    <queries>
+        <!-- speech_to_text uses the system speech recognizer Intent. -->
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
+        </intent>
+    </queries>
+
     <application
         android:label="MewSify"
         android:name="${applicationName}"
@@ -39,6 +49,26 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+
+            <!-- Deep link: shared YouTube URLs will offer to open in MewSify. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="https" android:host="youtu.be"/>
+                <data android:scheme="https" android:host="www.youtube.com" android:pathPrefix="/watch"/>
+                <data android:scheme="https" android:host="www.youtube.com" android:pathPrefix="/shorts/"/>
+                <data android:scheme="https" android:host="m.youtube.com" android:pathPrefix="/watch"/>
+                <data android:scheme="https" android:host="m.youtube.com" android:pathPrefix="/shorts/"/>
+            </intent-filter>
+
+            <!-- Custom mewsify:// scheme for direct deep links. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="mewsify"/>
             </intent-filter>
         </activity>
 

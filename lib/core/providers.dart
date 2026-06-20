@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:video_player/video_player.dart';
 
 import '../data/models/track.dart';
 import '../data/repositories/library_repository.dart';
@@ -113,6 +114,18 @@ final playerErrorProvider = StreamProvider<String?>((ref) {
 /// Whether the Now Playing screen renders the actual YouTube video
 /// (true) or just the album art (false). Defaults to "photo" mode.
 final videoModeProvider = StateProvider<bool>((ref) => false);
+
+/// The currently active VideoPlayerController, set by VideoView when
+/// video mode is on. Null in audio mode. Wired up so the player's
+/// transport row can drive playback against whichever player is
+/// currently "primary".
+final videoControllerProvider = StateProvider<VideoPlayerController?>(
+  (ref) => null,
+);
+
+/// Whether the active video controller is currently playing. Updates
+/// via a periodic listener wired in VideoView.
+final videoPlayingProvider = StateProvider<bool>((ref) => false);
 
 /// Reactive shuffle mode for the player UI.
 final shuffleModeProvider = StreamProvider<bool>((ref) {

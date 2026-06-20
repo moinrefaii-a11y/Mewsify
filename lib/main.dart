@@ -3,21 +3,33 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
+import 'dart:async';
+
+import 'package:flutter_native_splash/flutter_native_splash.dart';
+
 import 'app.dart';
+import 'data/models/playlist.dart';
 import 'data/models/track.dart';
+import 'data/sources/youtube_source.dart';
 import 'services/audio_handler.dart';
+import 'services/deep_link_service.dart';
 
 late MelodyAudioHandler audioHandler;
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+  final binding = WidgetsFlutterBinding.ensureInitialized();
+  // Hold the native splash until our Flutter splash overlay takes over.
+  // Released in lib/features/splash/splash_overlay.dart's first frame.
+  FlutterNativeSplash.preserve(widgetsBinding: binding);
 
   // Local storage for library, history, downloads.
   await Hive.initFlutter();
   Hive.registerAdapter(TrackAdapter());
+  Hive.registerAdapter(PlaylistAdapter());
   await Hive.openBox<Track>('favorites');
   await Hive.openBox<Track>('history');
   await Hive.openBox<Track>('queue');
+  await Hive.openBox<Playlist>('playlists');
   await Hive.openBox<String>('recent_searches');
   await Hive.openBox('settings');
 
@@ -34,6 +46,10 @@ Future<void> main() async {
       androidNotificationIcon: 'mipmap/ic_launcher',
     ),
   );
+
+  // Listen for incoming YouTube / mewsify:// links so tapping a shared
+  // link from elsewhere opens the right track in the app.
+  unawaited(DeepLinkService(audioHandler, YouTubeSource()).start());
 
   runApp(const ProviderScope(child: MelodyApp()));
 }

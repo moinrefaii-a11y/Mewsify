@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import '../../core/providers.dart';
 import '../../data/models/track.dart';
@@ -29,6 +30,11 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
   /// Cache of results keyed by category so switching tabs is instant
   /// once we've fetched at least once.
   final Map<SearchCategory, List<Track>> _resultsByCategory = {};
+
+  // --- Voice search state ----------------------------------------------
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  bool _voiceReady = false;
+  bool _listening = false;
 
   late final TabController _tabs = TabController(length: 4, vsync: this)
     ..addListener(_onTabChanged);
@@ -167,6 +173,47 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
     }
   }
 
+  Future<void> _toggleListening() async {
+    if (_listening) {
+      await _speech.stop();
+      setState(() => _listening = false);
+      return;
+    }
+    if (!_voiceReady) {
+      _voiceReady = await _speech.initialize(
+        onError: (e) {
+          debugPrint('[Voice] init error: ${e.errorMsg}');
+          if (mounted) setState(() => _listening = false);
+        },
+        onStatus: (status) {
+          if (status == 'notListening' || status == 'done') {
+            if (mounted) setState(() => _listening = false);
+          }
+        },
+      );
+      if (!_voiceReady) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Microphone permission needed for voice search')),
+          );
+        }
+        return;
+      }
+    }
+    setState(() => _listening = true);
+    await _speech.listen(
+      onResult: (result) {
+        _controller.text = result.recognizedWords;
+        _onChanged(result.recognizedWords);
+        if (result.finalResult) {
+          _runSearch(result.recognizedWords);
+        }
+      },
+      listenFor: const Duration(seconds: 8),
+      pauseFor: const Duration(seconds: 2),
+    );
+  }
+
   Future<void> _pasteFromClipboard() async {
     final data = await Clipboard.getData('text/plain');
     final text = data?.text;
@@ -214,6 +261,16 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
                 suffixIcon: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    IconButton(
+                      tooltip: _listening ? 'Stop listening' : 'Voice search',
+                      icon: Icon(
+                        _listening ? Icons.mic : Icons.mic_none_outlined,
+                        color: _listening
+                            ? Theme.of(context).colorScheme.primary
+                            : null,
+                      ),
+                      onPressed: _toggleListening,
+                    ),
                     IconButton(
                       tooltip: 'Paste link',
                       icon: const Icon(Icons.content_paste_outlined),

@@ -25,16 +25,10 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _init();
   }
 
-  /// Equalizer pipeline. Only wired into the primary `_a` to avoid
-  /// re-routing effects on every crossfade.
-  final AndroidEqualizer equalizer = AndroidEqualizer();
-  final AndroidLoudnessEnhancer loudnessEnhancer = AndroidLoudnessEnhancer();
-
-  late final AudioPlayer _a = AudioPlayer(
-    audioPipeline: AudioPipeline(
-      androidAudioEffects: [loudnessEnhancer, equalizer],
-    ),
-  );
+  /// Two AudioPlayer instances used in alternation for the two-player
+  /// crossfade. No audio pipeline / effects — keeps the player rock-
+  /// solid across all Android OEMs.
+  late final AudioPlayer _a = AudioPlayer();
   late final AudioPlayer _b = AudioPlayer();
 
   late AudioPlayer _player; // foreground player; UI listens to this

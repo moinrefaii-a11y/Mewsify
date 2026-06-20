@@ -61,14 +61,20 @@ class MiniPlayer extends ConsumerWidget {
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 child: Row(
                   children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(6),
-                      child: CachedNetworkImage(
-                        imageUrl: track.thumbnailUrl,
-                        width: 44,
-                        height: 44,
-                        fit: BoxFit.cover,
-                        errorWidget: (_, __, ___) => const Icon(Icons.music_note),
+                    Hero(
+                      tag: 'now-playing-art',
+                      child: Material(
+                        type: MaterialType.transparency,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: CachedNetworkImage(
+                            imageUrl: track.thumbnailUrl,
+                            width: 44,
+                            height: 44,
+                            fit: BoxFit.cover,
+                            errorWidget: (_, __, ___) => const Icon(Icons.music_note),
+                          ),
+                        ),
                       ),
                     ),
                     const SizedBox(width: 12),

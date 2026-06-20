@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core/providers.dart';
 import 'core/theme.dart';
 import 'features/shell/main_shell.dart';
+import 'features/splash/splash_overlay.dart';
 
 class MelodyApp extends ConsumerWidget {
   const MelodyApp({super.key});
@@ -18,7 +19,7 @@ class MelodyApp extends ConsumerWidget {
       theme: MelodyTheme.light(seed),
       darkTheme: MelodyTheme.dark(seed),
       themeMode: mode,
-      home: const MainShell(),
+      home: const SplashOverlay(child: MainShell()),
     );
   }
 }

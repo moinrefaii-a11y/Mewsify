@@ -94,6 +94,11 @@ class _VideoViewState extends ConsumerState<VideoView> {
     await next.seekTo(position);
     await next.play();
 
+    // Mirror playing state into a Riverpod provider so the player's
+    // transport row reflects the video's actual state (not the
+    // audio handler's, which is paused while video plays).
+    next.addListener(_publishVideoPlaying);
+
     setState(() {
       _controller = next;
       _qualities = all;
@@ -101,12 +106,32 @@ class _VideoViewState extends ConsumerState<VideoView> {
       _loading = false;
     });
 
-    await old?.dispose();
+    // Publish to Riverpod for the transport row to read.
+    ref.read(videoControllerProvider.notifier).state = next;
+    ref.read(videoPlayingProvider.notifier).state = true;
+
+    if (old != null) {
+      old.removeListener(_publishVideoPlaying);
+      await old.dispose();
+    }
+  }
+
+  void _publishVideoPlaying() {
+    final c = _controller;
+    if (c == null) return;
+    ref.read(videoPlayingProvider.notifier).state = c.value.isPlaying;
   }
 
   void _disposeController() {
+    _controller?.removeListener(_publishVideoPlaying);
     _controller?.dispose();
     _controller = null;
+    // Clear the Riverpod state so the transport row stops trying to
+    // drive a disposed controller.
+    if (ref.read(videoControllerProvider) != null) {
+      ref.read(videoControllerProvider.notifier).state = null;
+      ref.read(videoPlayingProvider.notifier).state = false;
+    }
   }
 
   @override

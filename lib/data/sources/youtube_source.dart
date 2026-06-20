@@ -109,10 +109,13 @@ class YouTubeSource {
     return audio.url.toString();
   }
 
-  /// Resolve a video stream. Returns a list of qualities the user can
-  /// pick from; each entry has a label (e.g. "720p") and the URL.
-  /// We prefer "muxed" streams (combined video+audio) because the
-  /// `video_player` widget can't mux DASH streams in real time.
+  /// Resolve video streams for the player. Returns one or more
+  /// quality options the user can switch between.
+  ///
+  /// `video_player` only handles "muxed" streams (audio + video in one
+  /// container). For tracks that lack muxed streams (most YouTube Music
+  /// catalog) we surface a single "Audio only" entry so the player
+  /// still loads and the toggle doesn't dead-end.
   Future<List<VideoStreamOption>> resolveVideoStreams(String videoId) async {
     final manifest = await _resolveStreams(videoId);
     final options = manifest.muxed.map((s) {
@@ -121,9 +124,23 @@ class YouTubeSource {
         url: s.url.toString(),
         height: _heightForQuality(s.videoQuality),
         bitrate: s.bitrate.bitsPerSecond,
+        audioOnly: false,
       );
     }).toList()
       ..sort((a, b) => b.height.compareTo(a.height));
+
+    if (options.isEmpty && manifest.audioOnly.isNotEmpty) {
+      // Fall back to the best audio-only stream so the video toggle
+      // still has something to play (will render as a black canvas).
+      final audio = manifest.audioOnly.withHighestBitrate();
+      options.add(VideoStreamOption(
+        label: 'Audio only',
+        url: audio.url.toString(),
+        height: 0,
+        bitrate: audio.bitrate.bitsPerSecond,
+        audioOnly: true,
+      ));
+    }
     return options;
   }
 
@@ -245,14 +262,17 @@ class VideoStreamOption {
   final String url;
   final int height; // in px
   final int bitrate; // bits/sec
+  final bool audioOnly;
   const VideoStreamOption({
     required this.label,
     required this.url,
     required this.height,
     required this.bitrate,
+    this.audioOnly = false,
   });
 
   String get qualityLabel {
+    if (audioOnly) return 'Audio';
     if (height >= 2160) return '2160p';
     if (height >= 1440) return '1440p';
     if (height >= 1080) return '1080p';

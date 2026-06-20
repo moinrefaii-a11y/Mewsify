@@ -1,11 +1,12 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 import '../../core/providers.dart';
 import '../../data/models/track.dart';
+import '../../widgets/eq_indicator.dart';
 import '../../widgets/track_actions_sheet.dart';
+import '../../widgets/track_artwork.dart';
 import '../../widgets/track_tile.dart';
 import 'genre_chips.dart';
 
@@ -338,22 +339,13 @@ class _QuickAccessGrid extends StatelessWidget {
               onLongPress: () => TrackActionsSheet.show(context, t),
               child: Row(
                 children: [
-                  ClipRRect(
+                  TrackArtwork(
+                    url: t.thumbnailUrl,
+                    width: 56,
+                    height: 56,
                     borderRadius: const BorderRadius.only(
                       topLeft: Radius.circular(8),
                       bottomLeft: Radius.circular(8),
-                    ),
-                    child: CachedNetworkImage(
-                      imageUrl: t.thumbnailUrl,
-                      width: 56,
-                      height: 56,
-                      fit: BoxFit.cover,
-                      errorWidget: (_, __, ___) => Container(
-                        width: 56,
-                        height: 56,
-                        color: Colors.black26,
-                        child: const Icon(Icons.music_note),
-                      ),
                     ),
                   ),
                   Expanded(
@@ -489,24 +481,17 @@ class _CarouselCard extends StatelessWidget {
               borderRadius: BorderRadius.circular(10),
               child: Stack(
                 children: [
-                  CachedNetworkImage(
-                    imageUrl: track.thumbnailUrl,
+                  TrackArtwork(
+                    url: track.thumbnailUrl,
                     width: size,
                     height: size,
-                    fit: BoxFit.cover,
-                    errorWidget: (_, __, ___) => Container(
-                      width: size,
-                      height: size,
-                      color: scheme.surfaceContainerHighest,
-                      child: const Icon(Icons.music_note, size: 40),
-                    ),
                   ),
                   if (isCurrent)
                     Positioned.fill(
                       child: Container(
                         color: Colors.black.withValues(alpha: 0.45),
                         child: Center(
-                          child: Icon(Icons.equalizer, color: scheme.primary, size: 32),
+                          child: EqIndicator(size: 28, color: scheme.primary),
                         ),
                       ),
                     ),
