@@ -8,11 +8,15 @@ import AVFoundation
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    // Configure the audio session to keep playback alive in the background
-    // and route through the device's media controls. just_audio normally
-    // does this itself, but setting it here guarantees behavior on cold start.
+    // .playback keeps audio alive when backgrounded / locked.
+    // .moviePlayback mode pairs with video_player so iOS PiP can take
+    // over the session when entering Picture-in-Picture.
     do {
-      try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+      try AVAudioSession.sharedInstance().setCategory(
+        .playback,
+        mode: .moviePlayback,
+        options: [.allowAirPlay, .allowBluetoothA2DP]
+      )
       try AVAudioSession.sharedInstance().setActive(true)
     } catch {
       print("AVAudioSession setup failed: \(error)")
