@@ -1,0 +1,79 @@
+name: melody
+description: A YouTube-powered music streamer with background playback, downloads, and offline support.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+
+  # State management
+  flutter_riverpod: ^2.5.1
+
+  # Routing
+  go_router: ^14.1.4
+
+  # Audio playback + background service
+  just_audio: ^0.9.40
+  audio_service: ^0.18.15
+  audio_session: ^0.1.21
+  rxdart: ^0.27.7
+
+  # YouTube extraction (InnerTube client, Dart port of youtube-dl)
+  # Pinned to 3.x for the PO-token-aware extractor.
+  youtube_explode_dart: ^3.1.0
+
+  # WebView fallback (Demus-style approach)
+  flutter_inappwebview: ^6.1.5
+
+  # Permissions (overlay window on Android)
+  permission_handler: ^11.3.1
+
+  # Local storage
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+
+  # HTTP for InnerTube calls
+  http: ^1.2.1
+
+  # Native video playback (for video mode in the player)
+  video_player: ^2.9.1
+
+  # Image caching
+  cached_network_image: ^3.3.1
+
+  # Album art color extraction (Spotify-style player gradient)
+  palette_generator: ^0.3.3+5
+
+  # Floating popup overlay (Android only)
+  flutter_overlay_window: ^0.4.5
+
+  # Utilities
+  share_plus: ^12.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  hive_generator: ^2.0.1
+  build_runner: ^2.4.11
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+
+flutter_launcher_icons:
+  android: "ic_launcher"
+  ios: true
+  image_path: "assets/images/app_icon.png"
+  remove_alpha_ios: true
+  adaptive_icon_background: "#0F0F10"
+  adaptive_icon_foreground: "assets/images/app_icon_foreground.png"
+  min_sdk_android: 23
