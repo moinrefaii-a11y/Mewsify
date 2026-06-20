@@ -43,7 +43,7 @@ Future<void> main() async {
       androidNotificationChannelName: 'MewSify Playback',
       androidNotificationOngoing: true,
       androidStopForegroundOnPause: true,
-      androidNotificationIcon: 'drawable/ic_notification',
+      androidNotificationIcon: 'mipmap/ic_launcher',
     ),
   );
 

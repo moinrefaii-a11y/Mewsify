@@ -31,6 +31,8 @@ class PlayerScreen extends ConsumerWidget {
     return Scaffold(
       backgroundColor: Theme.of(context).colorScheme.surface,
       body: trackAsync.when(
+        skipLoadingOnReload: true,
+        skipLoadingOnRefresh: true,
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => Center(child: Text('$e')),
         data: (track) {
@@ -53,22 +55,21 @@ class PlayerScreen extends ConsumerWidget {
                           final handler = ref.read(audioHandlerProvider);
                           final newMode = !ref.read(videoModeProvider);
                           if (newMode) {
-                            // Entering video mode — pause audio cleanly.
                             await handler.pause();
+                            ref.read(videoModeProvider.notifier).state = true;
                           } else {
-                            // Leaving video mode. The VideoView's
-                            // dispose() reports the last YouTube
-                            // position back through onPositionChange,
-                            // which we use to seek the audio handler.
-                            // The lastVideoPosition state is set
-                            // from there.
+                            // Switch off video mode first — this disposes
+                            // VideoView which writes its last position
+                            // to _lastVideoPositionProvider via onPositionChange.
+                            ref.read(videoModeProvider.notifier).state = false;
+                            // Give the frame a chance to dispose the widget.
+                            await Future.delayed(const Duration(milliseconds: 50));
                             final pos = ref.read(_lastVideoPositionProvider);
                             if (pos > Duration.zero) {
                               await handler.seek(pos);
                             }
                             await handler.play();
                           }
-                          ref.read(videoModeProvider.notifier).state = newMode;
                           PipService.instance.setVideoMode(newMode);
                         },
                       ),
@@ -185,21 +186,41 @@ class PlayerScreen extends ConsumerWidget {
   }
 }
 
-/// Spotify-style gradient backdrop. The dominant color is extracted
-/// from the album art and used as the top of a gradient that fades to
-/// near-black at the bottom, giving the player a colorful but readable
-/// surface that recolors with every track.
-class _BlurredBackdrop extends StatelessWidget {
+/// Spotify-style gradient backdrop. Caches the palette future so it
+/// doesn't re-extract on every rebuild (which was causing the player
+/// to freeze/stick when opening).
+class _BlurredBackdrop extends StatefulWidget {
   final String url;
   const _BlurredBackdrop({required this.url});
 
   @override
+  State<_BlurredBackdrop> createState() => _BlurredBackdropState();
+}
+
+class _BlurredBackdropState extends State<_BlurredBackdrop> {
+  late Future<MelodyPalette> _paletteFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _paletteFuture = PaletteService.instance.getPalette(widget.url);
+  }
+
+  @override
+  void didUpdateWidget(covariant _BlurredBackdrop old) {
+    super.didUpdateWidget(old);
+    if (old.url != widget.url) {
+      _paletteFuture = PaletteService.instance.getPalette(widget.url);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final base = Theme.of(context).colorScheme.surface;
     return FutureBuilder<MelodyPalette>(
-      future: PaletteService.instance.getPalette(url),
+      future: _paletteFuture,
       builder: (context, snap) {
         final palette = snap.data;
-        final base = Theme.of(context).colorScheme.surface;
         return AnimatedContainer(
           duration: const Duration(milliseconds: 600),
           curve: Curves.easeOut,
