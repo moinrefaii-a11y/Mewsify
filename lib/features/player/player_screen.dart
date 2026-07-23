@@ -382,11 +382,9 @@ class _ScrubberState extends ConsumerState<_Scrubber> {
 
   @override
   Widget build(BuildContext context) {
-    // In video mode the YouTube embed handles its own scrubber and
-    // quality picker, so we hide ours to avoid confusion.
-    final videoMode = ref.watch(videoModeProvider);
-    if (videoMode) return const SizedBox(height: 24);
-
+    // Same scrubber in video and audio modes — audio is the master
+    // timeline that the video slaves to, so scrubbing here also scrubs
+    // the video.
     final pos = widget.progress?.position ?? Duration.zero;
     final dur = widget.progress?.duration ?? Duration.zero;
     return _build(pos: pos, dur: dur, onSeek: widget.onSeek);

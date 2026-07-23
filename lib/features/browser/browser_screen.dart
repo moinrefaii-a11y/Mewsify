@@ -71,31 +71,81 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
   }
 
   Future<void> _applyAdSkipAndCleanup(InAppWebViewController c) async {
-    // Small CSS: hide the "install the YouTube app" banners.
+    // CSS: hide the "install the YouTube app" and consent banners
+    // (both mobile web and pre-consent overlays).
     await c.injectCSSCode(source: r'''
       ytm-mealbar-promo-renderer, ytm-consent-bump-v2-lightbox,
-      ytm-privacy-tos-footer-renderer { display: none !important; }
+      ytm-privacy-tos-footer-renderer, ytm-ads-engagement-panel-content-renderer,
+      ytm-companion-ad-renderer, ytm-promoted-video-renderer,
+      ytm-promoted-sparkles-web-renderer, .ytp-ad-overlay-container,
+      .ytp-ad-image-overlay, .video-ads {
+        display: none !important;
+      }
     ''');
-    // JS: auto-skip ads + mute/fast-forward unskippable ones.
+    // JS: aggressive ad handling. We combine three tactics:
+    //   1. Wide selector list of every skip-ad variant.
+    //   2. A MutationObserver so the moment YouTube inserts an ad DOM
+    //      node we react (instead of waiting for the next 200 ms tick).
+    //   3. During any ad state — even before the skip button appears —
+    //      we mute the video and crank playbackRate to 16× so the ad
+    //      is over in a fraction of a second.
     await c.evaluateJavascript(source: r'''
       (function() {
-        if (window.__mewsifyBrowseTimer) return;
-        window.__mewsifyBrowseTimer = setInterval(function() {
-          try {
-            var skip = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
-            if (skip) skip.click();
-            var v = document.querySelector('video');
-            if (!v) return;
-            var adOverlay = document.querySelector('.ytp-ad-player-overlay, .ytp-ad-player-overlay-instream-info, .ad-showing');
-            if (adOverlay || document.querySelector('.ad-container-single-media-element')) {
-              v.muted = true;
-              try { v.playbackRate = 4; } catch(e) {}
-            } else if (v.playbackRate !== 1) {
-              v.muted = false;
-              try { v.playbackRate = 1; } catch(e) {}
-            }
-          } catch(e) {}
-        }, 200);
+        if (window.__mewsifyBrowseAdSkip) return;
+        window.__mewsifyBrowseAdSkip = true;
+
+        function isAdShowing() {
+          if (document.querySelector('.ad-showing')) return true;
+          if (document.querySelector('.ytp-ad-player-overlay')) return true;
+          if (document.querySelector('.ytp-ad-player-overlay-instream-info')) return true;
+          if (document.querySelector('.ad-container-single-media-element')) return true;
+          if (document.querySelector('.ytp-ad-preview-container')) return true;
+          if (document.querySelector('.ytp-ad-persistent-progress-bar-container')) return true;
+          if (document.querySelector('ytm-companion-slot')) return true;
+          return false;
+        }
+
+        function tryClickSkip() {
+          var selectors = [
+            '.ytp-ad-skip-button',
+            '.ytp-ad-skip-button-modern',
+            '.ytp-skip-ad-button',
+            '.ytp-ad-skip-button-container button',
+            'button.ytp-ad-skip-button-modern',
+            'button[aria-label*="Skip"]',
+            'button[aria-label*="skip"]',
+            '.videoAdUiSkipButton',
+          ];
+          for (var i = 0; i < selectors.length; i++) {
+            var el = document.querySelector(selectors[i]);
+            if (el) { try { el.click(); return true; } catch(e) {} }
+          }
+          return false;
+        }
+
+        function handleAd() {
+          var v = document.querySelector('video');
+          if (!v) return;
+          if (isAdShowing()) {
+            if (!v.muted) v.muted = true;
+            try { if (v.playbackRate < 8) v.playbackRate = 16; } catch(e) {}
+            tryClickSkip();
+            // Nuke the ad container hard: seek to the end of the ad.
+            try { if (v.duration && !isNaN(v.duration)) v.currentTime = v.duration; } catch(e) {}
+          } else {
+            if (v.muted) v.muted = false;
+            try { if (v.playbackRate !== 1) v.playbackRate = 1; } catch(e) {}
+          }
+        }
+
+        // Fast periodic tick catches state changes the observer misses.
+        setInterval(handleAd, 150);
+
+        // Immediate reactions to DOM insertions.
+        var obs = new MutationObserver(function() { handleAd(); });
+        try {
+          obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+        } catch(e) {}
       })();
     ''');
   }

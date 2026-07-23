@@ -100,7 +100,35 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       if (index == null || _currentIndex >= _queue.length) return;
       mediaItem.add(_queue[_currentIndex].toMediaItem());
     });
+
+    // When just_audio resolves the real duration of the current track,
+    // rebroadcast the MediaItem with that duration. Bluetooth head units
+    // (AVRCP) and Android Auto need a non-zero duration to display track
+    // info — otherwise you get "No info provided" on the car screen.
+    _durationSub?.cancel();
+    _durationSub = _player.durationStream.listen((d) {
+      if (d == null || d == Duration.zero) return;
+      if (_currentIndex < 0 || _currentIndex >= _queue.length) return;
+      final current = _queue[_currentIndex];
+      // Update the queue entry so future reads (and lock screen "next")
+      // carry the correct duration too.
+      if (current.duration != d) {
+        _queue[_currentIndex] = Track(
+          id: current.id,
+          title: current.title,
+          artist: current.artist,
+          album: current.album,
+          thumbnailUrl: current.thumbnailUrl,
+          duration: d,
+          sourceVideoId: current.sourceVideoId,
+          addedAt: current.addedAt,
+        );
+      }
+      mediaItem.add(current.toMediaItem().copyWith(duration: d));
+    });
   }
+
+  StreamSubscription? _durationSub;
 
   // --- Queue persistence ------------------------------------------------
 
@@ -234,8 +262,10 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   }
 
   int _crossfadeSeconds() {
-    if (!Hive.isBoxOpen('settings')) return 0;
-    return (Hive.box('settings').get('crossfadeSeconds', defaultValue: 0) as int)
+    if (!Hive.isBoxOpen('settings')) return 5;
+    // Default 5 s so the Apple-Music-style end-of-song mix fires out of
+    // the box; user can dial it down / off in Settings.
+    return (Hive.box('settings').get('crossfadeSeconds', defaultValue: 5) as int)
         .clamp(0, 12);
   }
 
@@ -314,6 +344,13 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       await _player.seek(Duration.zero);
       await _player.play();
       return;
+    }
+    // Try to extend the queue with related tracks if we don't already
+    // have a next slot lined up. This makes autoplay work exactly like
+    // YouTube / YouTube Music — the "up next" is inferred from what's
+    // playing now, not a fixed playlist.
+    if (_peekNextIndex() == null && _queue.isNotEmpty) {
+      await _appendRelatedToQueue(_queue.last.sourceVideoId);
     }
     final hasNext = _peekNextIndex() != null;
     if (hasNext) {

@@ -262,6 +262,105 @@ class YouTubeSource {
     return related.take(limit).map(_videoToTrack).toList();
   }
 
+  /// Real YouTube channel uploads — matches what you see on the channel's
+  /// "Videos" tab (title, upload date, view count). Returns Tracks with
+  /// the `album` field populated with "X ago · Y views" so the UI can
+  /// display that YouTube-style subtitle without a new model field.
+  Future<List<Track>> channelUploads(
+    String channelId, {
+    int limit = 30,
+  }) async {
+    try {
+      final uploads =
+          await _yt.channels.getUploads(channelId).take(limit).toList();
+      return uploads.map(_videoToChannelTrack).toList();
+    } catch (e) {
+      debugPrint('[YouTubeSource] channelUploads failed: $e');
+      // Best-effort fallback: search for the channel's name.
+      try {
+        final channel = await _yt.channels.get(channelId);
+        return search(channel.title, limit: limit);
+      } catch (_) {
+        return const [];
+      }
+    }
+  }
+
+  /// Fetches the top-level channel metadata (name, subscriber count,
+  /// large avatar). Null on any failure so the caller can degrade
+  /// gracefully.
+  Future<ChannelMeta?> channelInfo(String channelId) async {
+    try {
+      final c = await _yt.channels.get(channelId);
+      String avatar = c.logoUrl;
+      // Rewrite the "=s##..." size suffix (if present) for a big fetch.
+      avatar = avatar.replaceFirstMapped(
+        RegExp(r'=s\d+'),
+        (_) => '=s720',
+      );
+      return ChannelMeta(
+        id: c.id.value,
+        title: c.title,
+        avatarUrl: avatar,
+        subscribers: c.subscribersCount ?? 0,
+      );
+    } catch (e) {
+      debugPrint('[YouTubeSource] channelInfo failed: $e');
+      return null;
+    }
+  }
+
+  Track _videoToChannelTrack(Video v) {
+    return Track(
+      id: 'yt:${v.id.value}',
+      title: v.title,
+      artist: v.author,
+      // Reused as a subtitle line so channel results feel like YouTube
+      // (upload date + view count).
+      album: _formatUploadSubtitle(v),
+      thumbnailUrl: 'https://i.ytimg.com/vi/${v.id.value}/hq720.jpg',
+      duration: v.duration ?? Duration.zero,
+      sourceVideoId: v.id.value,
+      addedAt: DateTime.now(),
+    );
+  }
+
+  String _formatUploadSubtitle(Video v) {
+    final parts = <String>[];
+    if (v.uploadDate != null) {
+      parts.add(_ago(v.uploadDate!));
+    } else if (v.publishDate != null) {
+      parts.add(_ago(v.publishDate!));
+    }
+    parts.add('${_compact(v.engagement.viewCount)} views');
+    return parts.join(' · ');
+  }
+
+  /// "3 days ago", "2 months ago", "1 year ago"
+  String _ago(DateTime d) {
+    final diff = DateTime.now().difference(d);
+    if (diff.inDays > 365) {
+      final y = diff.inDays ~/ 365;
+      return '$y year${y == 1 ? '' : 's'} ago';
+    }
+    if (diff.inDays > 30) {
+      final m = diff.inDays ~/ 30;
+      return '$m month${m == 1 ? '' : 's'} ago';
+    }
+    if (diff.inDays > 0) return '${diff.inDays} day${diff.inDays == 1 ? '' : 's'} ago';
+    if (diff.inHours > 0) return '${diff.inHours} hour${diff.inHours == 1 ? '' : 's'} ago';
+    if (diff.inMinutes > 0) return '${diff.inMinutes} min ago';
+    return 'just now';
+  }
+
+  /// "1.2M", "3.4K", "999"
+  String _compact(int n) {
+    if (n >= 1000000000) return '${(n / 1000000000).toStringAsFixed(1)}B';
+    if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
+    if (n >= 1000) return '${(n / 1000).toStringAsFixed(1)}K';
+    return '$n';
+  }
+
   Track _videoToTrack(Video v) {
     final thumb = v.thumbnails.highResUrl;
     return Track(
@@ -305,6 +404,20 @@ class YouTubeSource {
     _yt.close();
     _piped.dispose();
   }
+}
+
+/// Basic channel-level metadata for the artist header on a channel page.
+class ChannelMeta {
+  final String id;
+  final String title;
+  final String avatarUrl;
+  final int subscribers;
+  const ChannelMeta({
+    required this.id,
+    required this.title,
+    required this.avatarUrl,
+    required this.subscribers,
+  });
 }
 
 /// One playable video quality option (e.g. "720p mp4 — 1.2 Mbps").

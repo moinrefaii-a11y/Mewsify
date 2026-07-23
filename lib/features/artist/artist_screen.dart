@@ -4,23 +4,28 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers.dart';
 import '../../data/models/track.dart';
+import '../../data/sources/youtube_source.dart';
 import '../../services/palette_service.dart';
 import '../../widgets/track_actions_sheet.dart';
 import '../../widgets/track_tile.dart';
 
-/// Spotify-style artist page.
+/// Artist / channel page.
 ///
-/// Search YouTube Music for the artist, render a hero header (large
-/// circular avatar + name), then a "Popular" list of their songs and
-/// a "Play all" / "Shuffle" call-to-action.
+/// If a [channelId] is supplied we treat this as a real YouTube channel
+/// and fetch the channel's actual uploads (upload dates, view counts,
+/// avatar, subscriber count) via youtube_explode_dart. Otherwise we
+/// fall back to a music-oriented Spotify-style artist page driven by
+/// a name search.
 class ArtistScreen extends ConsumerStatefulWidget {
   final String artistName;
   final String? seedThumbnail;
+  final String? channelId;
 
   const ArtistScreen({
     super.key,
     required this.artistName,
     this.seedThumbnail,
+    this.channelId,
   });
 
   @override
@@ -29,11 +34,18 @@ class ArtistScreen extends ConsumerStatefulWidget {
 
 class _ArtistScreenState extends ConsumerState<ArtistScreen> {
   late Future<List<Track>> _future;
+  Future<ChannelMeta?>? _channelMetaFuture;
 
   @override
   void initState() {
     super.initState();
-    _future = ref.read(youtubeSourceProvider).search(widget.artistName, limit: 40);
+    final source = ref.read(youtubeSourceProvider);
+    if (widget.channelId != null) {
+      _future = source.channelUploads(widget.channelId!, limit: 50);
+      _channelMetaFuture = source.channelInfo(widget.channelId!);
+    } else {
+      _future = source.search(widget.artistName, limit: 40);
+    }
   }
 
   @override
@@ -46,19 +58,19 @@ class _ArtistScreenState extends ConsumerState<ArtistScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           final tracks = snap.data ?? [];
-          // Filter to tracks where the artist matches (case-insensitive
-          // contains so "The Weeknd" matches "Weeknd" search).
-          final lowered = widget.artistName.toLowerCase();
-          final theirTracks = tracks
-              .where((t) => t.artist.toLowerCase().contains(lowered) ||
-                  lowered.contains(t.artist.toLowerCase()))
-              .toList();
-
-          // Use the first matching track's artwork as the hero avatar
-          // so it actually shows the artist (not random music album art).
-          final heroUrl = theirTracks.isNotEmpty
-              ? theirTracks.first.thumbnailUrl
-              : (widget.seedThumbnail ?? '');
+          // If this is a real channel we trust the API's uploads
+          // straight through — no name filtering — because the channel
+          // definition IS the ground truth.
+          final theirTracks = widget.channelId != null
+              ? tracks
+              : () {
+                  final lowered = widget.artistName.toLowerCase();
+                  return tracks
+                      .where((t) =>
+                          t.artist.toLowerCase().contains(lowered) ||
+                          lowered.contains(t.artist.toLowerCase()))
+                      .toList();
+                }();
 
           return CustomScrollView(
             slivers: [
@@ -66,10 +78,21 @@ class _ArtistScreenState extends ConsumerState<ArtistScreen> {
                 expandedHeight: 320,
                 pinned: true,
                 backgroundColor: Theme.of(context).colorScheme.surface,
-                flexibleSpace: _ArtistHero(
-                  name: widget.artistName,
-                  imageUrl: heroUrl,
-                  trackCount: theirTracks.length,
+                flexibleSpace: FutureBuilder<ChannelMeta?>(
+                  future: _channelMetaFuture,
+                  builder: (context, metaSnap) {
+                    final meta = metaSnap.data;
+                    final heroUrl = meta?.avatarUrl ??
+                        (theirTracks.isNotEmpty
+                            ? theirTracks.first.thumbnailUrl
+                            : (widget.seedThumbnail ?? ''));
+                    return _ArtistHero(
+                      name: meta?.title ?? widget.artistName,
+                      imageUrl: heroUrl,
+                      trackCount: theirTracks.length,
+                      subscribers: meta?.subscribers,
+                    );
+                  },
                 ),
               ),
               SliverToBoxAdapter(
@@ -87,12 +110,12 @@ class _ArtistScreenState extends ConsumerState<ArtistScreen> {
                   },
                 ),
               ),
-              const SliverPadding(
-                padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
                 sliver: SliverToBoxAdapter(
                   child: Text(
-                    'Popular',
-                    style: TextStyle(
+                    widget.channelId != null ? 'Videos' : 'Popular',
+                    style: const TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.w800,
                     ),
@@ -145,12 +168,24 @@ class _ArtistHero extends StatelessWidget {
   final String name;
   final String imageUrl;
   final int trackCount;
+  final int? subscribers;
 
   const _ArtistHero({
     required this.name,
     required this.imageUrl,
     required this.trackCount,
+    this.subscribers,
   });
+
+  String? _subCaption() {
+    final s = subscribers;
+    if (s == null || s <= 0) return null;
+    if (s >= 1000000) {
+      return '${(s / 1000000).toStringAsFixed(1)}M subscribers';
+    }
+    if (s >= 1000) return '${(s / 1000).toStringAsFixed(1)}K subscribers';
+    return '$s subscribers';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -190,40 +225,58 @@ class _ArtistHero extends StatelessWidget {
                   ),
                 ),
               ),
-              // Centered artist avatar
+              // Centered artist avatar + optional subscriber caption.
               Padding(
-                padding: const EdgeInsets.only(top: 60, bottom: 60),
-                child: Align(
-                  alignment: Alignment.topCenter,
-                  child: Container(
-                    decoration: const BoxDecoration(
-                      shape: BoxShape.circle,
-                      boxShadow: [
-                        BoxShadow(color: Colors.black54, blurRadius: 24, offset: Offset(0, 8)),
-                      ],
-                    ),
-                    child: ClipOval(
-                      child: imageUrl.isEmpty
-                          ? Container(
-                              width: 160,
-                              height: 160,
-                              color: Colors.black26,
-                              child: const Icon(Icons.person, size: 64, color: Colors.white70),
-                            )
-                          : CachedNetworkImage(
-                              imageUrl: imageUrl,
-                              width: 160,
-                              height: 160,
-                              fit: BoxFit.cover,
-                              errorWidget: (_, __, ___) => Container(
+                padding: const EdgeInsets.only(top: 60, bottom: 44),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.start,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Container(
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                              color: Colors.black54,
+                              blurRadius: 24,
+                              offset: Offset(0, 8)),
+                        ],
+                      ),
+                      child: ClipOval(
+                        child: imageUrl.isEmpty
+                            ? Container(
                                 width: 160,
                                 height: 160,
                                 color: Colors.black26,
-                                child: const Icon(Icons.person, size: 64),
+                                child: const Icon(Icons.person,
+                                    size: 64, color: Colors.white70),
+                              )
+                            : CachedNetworkImage(
+                                imageUrl: imageUrl,
+                                width: 160,
+                                height: 160,
+                                fit: BoxFit.cover,
+                                errorWidget: (_, __, ___) => Container(
+                                  width: 160,
+                                  height: 160,
+                                  color: Colors.black26,
+                                  child: const Icon(Icons.person, size: 64),
+                                ),
                               ),
-                            ),
+                      ),
                     ),
-                  ),
+                    if (_subCaption() != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        _subCaption()!,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ),
             ],

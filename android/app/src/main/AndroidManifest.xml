@@ -94,5 +94,12 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2"/>
+
+        <!-- Android Auto declaration — advertises MewSify as a media app
+             so head units and Auto can surface the current track,
+             playback controls, and browse the queue. -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc"/>
     </application>
 </manifest>

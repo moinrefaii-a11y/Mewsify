@@ -148,6 +148,22 @@ class TrackTile extends StatelessWidget {
                         fontSize: 12,
                       ),
                     ),
+                    // YouTube-style subtitle: "3 days ago · 1.2M views"
+                    if (track.album != null && track.album!.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        track.album!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Theme.of(context)
+                              .colorScheme
+                              .onSurface
+                              .withValues(alpha: 0.5),
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),

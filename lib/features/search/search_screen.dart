@@ -352,6 +352,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
               builder: (_) => ArtistScreen(
                 artistName: t.title,
                 seedThumbnail: t.thumbnailUrl,
+                channelId: t.sourceVideoId, // encoded channel id
               ),
             )),
           );
@@ -489,6 +490,7 @@ class _ArtistsGrid extends StatelessWidget {
             builder: (_) => ArtistScreen(
               artistName: displayName,
               seedThumbnail: t.thumbnailUrl,
+              channelId: isChannel ? t.sourceVideoId : null,
             ),
           )),
           child: Column(
