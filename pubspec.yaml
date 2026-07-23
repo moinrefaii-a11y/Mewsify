@@ -1,7 +1,7 @@
 name: melody
 description: A YouTube-powered music streamer with background playback, downloads, and offline support.
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.2.2+3
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -38,8 +38,10 @@ dependencies:
   hive: ^2.2.3
   hive_flutter: ^1.1.0
 
-  # HTTP for InnerTube calls
+  # HTTP for InnerTube calls + GitHub update checks
   http: ^1.2.1
+  package_info_plus: ^8.0.2
+  url_launcher: ^6.3.0
 
   # Deep link / URL handling (Spotify-style "open in MewSify" links)
   app_links: ^6.3.2

@@ -10,6 +10,7 @@ import '../../core/providers.dart';
 import '../../widgets/mini_player.dart';
 
 import '../browser/browser_screen.dart';
+import '../update/update_sheet.dart';
 
 /// Top-level scaffold: tabs + persistent mini player above the
 /// navigation bar. Tapping the mini player opens the full Now Playing
@@ -26,6 +27,22 @@ class _MainShellState extends ConsumerState<MainShell> {
 
   // Track which tabs have been visited to defer building until first visit.
   final Set<int> _visited = {0};
+
+  bool _updateChecked = false;
+
+  void _maybeShowUpdate() {
+    if (_updateChecked) return;
+    _updateChecked = true;
+    // Kick off in the next frame so the initial build finishes first.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.listenManual(updateCheckProvider, (_, next) {
+        final info = next.valueOrNull;
+        if (info == null) return;
+        if (UpdateSheet.isDismissed(info.version)) return;
+        if (mounted) UpdateSheet.show(context, info);
+      }, fireImmediately: true);
+    });
+  }
 
   static final List<Widget Function()> _pageBuilders = kIsWeb
       ? [
@@ -59,6 +76,8 @@ class _MainShellState extends ConsumerState<MainShell> {
 
   @override
   Widget build(BuildContext context) {
+    _maybeShowUpdate();
+
     // Show playback errors as a snackbar so the user knows why audio
     // isn't progressing instead of staring at a silent paused player.
     ref.listen(playerErrorProvider, (_, next) {

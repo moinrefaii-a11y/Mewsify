@@ -8,6 +8,7 @@ import '../data/sources/youtube_source.dart';
 import '../main.dart' show audioHandler;
 import '../services/audio_handler.dart';
 import '../services/overlay_service.dart';
+import '../services/update_service.dart';
 
 /// Singleton-style providers that hand out the long-lived services.
 final youtubeSourceProvider = Provider<YouTubeSource>((ref) {
@@ -118,6 +119,12 @@ final videoModeProvider = StateProvider<bool>((ref) => false);
 /// (We dropped video_player in favor of a YouTube embed for true HD
 /// playback. The embed is a black box — we just track on/off here.)
 final videoPlayingProvider = StateProvider<bool>((ref) => false);
+
+/// Result of the GitHub-based update check. Emits null when we're on
+/// the latest version or the check failed silently.
+final updateCheckProvider = FutureProvider<UpdateInfo?>((ref) async {
+  return UpdateService().check();
+});
 
 /// Reactive shuffle mode for the player UI.
 final shuffleModeProvider = StreamProvider<bool>((ref) {
