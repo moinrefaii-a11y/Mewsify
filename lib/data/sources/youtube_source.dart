@@ -109,6 +109,56 @@ class YouTubeSource {
     return audio.url.toString();
   }
 
+  /// Resolve a fresh **video-only** stream URL (ad-free — YouTube's
+  /// ads are injected by the player, not baked into the media). Used
+  /// for the Now Playing "video mode" so we can render actual HD
+  /// video alongside the audio-only stream in just_audio.
+  ///
+  /// Prefers MP4 (H.264) over WebM (VP9) because iOS AVPlayer only
+  /// handles H.264 reliably. Picks the highest-quality stream at or
+  /// below [preferredHeight] px so we don't blow through mobile data.
+  Future<String> resolveVideoOnlyUrl(
+    String videoId, {
+    int preferredHeight = 720,
+  }) async {
+    final manifest = await _resolveStreams(videoId);
+    final videoOnly = manifest.videoOnly.toList();
+    if (videoOnly.isEmpty) {
+      // Fall back to muxed if the client only returned muxed streams.
+      final muxed = manifest.muxed
+          .where((s) => s.container.name.toLowerCase() == 'mp4')
+          .toList()
+        ..sort((a, b) =>
+            _heightForQuality(b.videoQuality) -
+            _heightForQuality(a.videoQuality));
+      if (muxed.isEmpty) {
+        throw Exception('No video streams available for $videoId');
+      }
+      return muxed.first.url.toString();
+    }
+
+    // Prefer MP4 first; only fall back to non-MP4 when MP4 is missing.
+    final mp4 = videoOnly
+        .where((s) => s.container.name.toLowerCase() == 'mp4')
+        .toList();
+    final pool = mp4.isNotEmpty ? mp4 : videoOnly;
+
+    // Sort tallest → shortest so we can walk down to the preferred height.
+    pool.sort((a, b) =>
+        _heightForQuality(b.videoQuality) -
+        _heightForQuality(a.videoQuality));
+
+    // Pick the tallest stream ≤ preferredHeight; if none exist, use the
+    // shortest available (which will always be ≤ preferredHeight).
+    final picked = pool.firstWhere(
+      (s) => _heightForQuality(s.videoQuality) <= preferredHeight,
+      orElse: () => pool.last,
+    );
+    debugPrint('[YouTubeSource] video-only ${picked.videoQuality.name} '
+        '(${picked.container.name}) for $videoId');
+    return picked.url.toString();
+  }
+
   /// Resolve video streams for the player. Returns one or more
   /// quality options the user can switch between.
   ///

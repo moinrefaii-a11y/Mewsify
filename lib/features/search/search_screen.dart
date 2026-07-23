@@ -344,6 +344,18 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
       itemCount: results.length,
       itemBuilder: (_, i) {
         final t = results[i];
+        // Channel result — tap opens the artist page instead of playing.
+        if (t.id.startsWith('ytch:')) {
+          return _ChannelTile(
+            channel: t,
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => ArtistScreen(
+                artistName: t.title,
+                seedThumbnail: t.thumbnailUrl,
+              ),
+            )),
+          );
+        }
         return TrackTile(
           track: t,
           wide: true,
@@ -435,19 +447,26 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
   }
 }
 
-/// Artist results render as a grid of round-thumbnail cards.
+/// Artist results render as a grid of round-thumbnail cards. If the
+/// server returned real channel results (id prefix "ytch:") we render
+/// those directly; otherwise we fall back to deduplicating the track
+/// results by author name so the tab is never empty.
 class _ArtistsGrid extends StatelessWidget {
   final List<Track> artists;
   const _ArtistsGrid({required this.artists});
 
   @override
   Widget build(BuildContext context) {
-    // Deduplicate by artist name — the search results may include
-    // multiple tracks per artist.
-    final seen = <String>{};
+    final channels = artists.where((t) => t.id.startsWith('ytch:')).toList();
     final uniqueArtists = <Track>[];
-    for (final t in artists) {
-      if (seen.add(t.artist.toLowerCase())) uniqueArtists.add(t);
+    if (channels.isNotEmpty) {
+      uniqueArtists.addAll(channels);
+    } else {
+      // Fall back to deduping the mixed-track results by author.
+      final seen = <String>{};
+      for (final t in artists) {
+        if (seen.add(t.artist.toLowerCase())) uniqueArtists.add(t);
+      }
     }
 
     return GridView.builder(
@@ -461,9 +480,16 @@ class _ArtistsGrid extends StatelessWidget {
       itemCount: uniqueArtists.length,
       itemBuilder: (context, i) {
         final t = uniqueArtists[i];
+        // For channel entries the display name is the channel title;
+        // for fallback dedup entries it's the track artist field.
+        final isChannel = t.id.startsWith('ytch:');
+        final displayName = isChannel ? t.title : t.artist;
         return GestureDetector(
           onTap: () => Navigator.of(context).push(MaterialPageRoute(
-            builder: (_) => ArtistScreen(artistName: t.artist, seedThumbnail: t.thumbnailUrl),
+            builder: (_) => ArtistScreen(
+              artistName: displayName,
+              seedThumbnail: t.thumbnailUrl,
+            ),
           )),
           child: Column(
             children: [
@@ -483,7 +509,7 @@ class _ArtistsGrid extends StatelessWidget {
               ),
               const SizedBox(height: 10),
               Text(
-                t.artist,
+                displayName,
                 maxLines: 2,
                 textAlign: TextAlign.center,
                 overflow: TextOverflow.ellipsis,
@@ -493,6 +519,50 @@ class _ArtistsGrid extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+/// Row tile for a channel result inside the "All" search tab.
+class _ChannelTile extends StatelessWidget {
+  final Track channel;
+  final VoidCallback onTap;
+  const _ChannelTile({required this.channel, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      onTap: onTap,
+      leading: ClipOval(
+        child: Image.network(
+          channel.thumbnailUrl,
+          width: 44,
+          height: 44,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => Container(
+            width: 44,
+            height: 44,
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+            child: const Icon(Icons.person, size: 24),
+          ),
+        ),
+      ),
+      title: Text(
+        channel.title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontWeight: FontWeight.w700),
+      ),
+      subtitle: Text(
+        'Channel · ${channel.artist}',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 12,
+          color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6),
+        ),
+      ),
+      trailing: const Icon(Icons.arrow_forward_ios, size: 14),
     );
   }
 }

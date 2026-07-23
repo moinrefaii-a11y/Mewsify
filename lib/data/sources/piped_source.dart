@@ -122,6 +122,11 @@ class PipedSource {
           final track = _parseVideoRenderer(v);
           if (track != null) tracks.add(track);
         }
+        final ch = node['channelRenderer'];
+        if (ch is Map<String, dynamic>) {
+          final channel = _parseChannelRenderer(ch);
+          if (channel != null) tracks.add(channel);
+        }
         for (final value in node.values) {
           recurse(value);
         }
@@ -134,6 +139,52 @@ class PipedSource {
 
     recurse(data);
     return tracks;
+  }
+
+  /// A YouTube channel result is encoded as a Track with an "ytch:"
+  /// id prefix so the search UI can distinguish it from a playable
+  /// video and route the tap to the artist page.
+  Track? _parseChannelRenderer(Map<String, dynamic> ch) {
+    try {
+      final channelId = ch['channelId']?.toString();
+      if (channelId == null || channelId.isEmpty) return null;
+      final title = (ch['title']?['simpleText'])?.toString() ??
+          (((ch['title']?['runs']) as List?)?.first?['text'])?.toString() ??
+          '';
+      if (title.isEmpty) return null;
+
+      // Thumbnails come back as a list of {url, width, height} at
+      // increasing sizes — take the last (biggest).
+      String thumb = '';
+      final thumbs =
+          ((ch['thumbnail'] as Map?)?['thumbnails']) as List?;
+      if (thumbs != null && thumbs.isNotEmpty) {
+        final raw = (thumbs.last as Map)['url']?.toString() ?? '';
+        // Rewrite the "=s##-c-k..." size suffix to force a big fetch.
+        thumb = raw.replaceFirstMapped(
+          RegExp(r'=s\d+'),
+          (_) => '=s720',
+        );
+        if (thumb.startsWith('//')) thumb = 'https:$thumb';
+      }
+
+      final subCountText =
+          (ch['videoCountText']?['simpleText'])?.toString() ??
+              (ch['subscriberCountText']?['simpleText'])?.toString() ??
+              '';
+
+      return Track(
+        id: 'ytch:$channelId',
+        title: title,
+        artist: subCountText.isNotEmpty ? subCountText : 'Channel',
+        thumbnailUrl: thumb,
+        duration: Duration.zero,
+        sourceVideoId: channelId, // reused slot for channel id
+        addedAt: DateTime.now(),
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   Track? _parseVideoRenderer(Map<String, dynamic> v) {

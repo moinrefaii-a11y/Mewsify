@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:hive/hive.dart';
 import 'package:just_audio/just_audio.dart';
@@ -172,7 +173,11 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     queue.add(_queue.map((t) => t.toMediaItem()).toList());
     await _playIndex(0);
     await _persistQueue();
-    _appendRelatedToQueue(seed.sourceVideoId);
+    // Await the related-tracks fetch so the queue is populated *before*
+    // the current track can end. Previously we fired-and-forgot which
+    // meant Next / auto-advance could be a no-op if the fetch hadn't
+    // returned in time.
+    await _appendRelatedToQueue(seed.sourceVideoId);
   }
 
   Future<void> _playIndex(int index, [int retryCount = 0]) async {
@@ -200,24 +205,29 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
   // --- Crossfade --------------------------------------------------------
 
-  /// Watchdog: every second, check if we're inside the crossfade window
-  /// of the currently-playing track. If so, kick off the overlap.
-  /// We don't even start a Timer when crossfade is off (default) so
-  /// the audio handler is idle outside of actual playback events.
+  /// Watchdog: every 250 ms, check if we're inside the crossfade window
+  /// of the currently-playing track. 250 ms is fine-grained enough that
+  /// we won't miss the trigger window for short crossfades (e.g. 3 s).
+  /// Idle-cost is minimal: we only run when crossfadeSeconds > 0.
   void _scheduleCrossfade() {
     _crossfadeWatchdog?.cancel();
     final seconds = _crossfadeSeconds();
     if (seconds <= 0) return;
-    _crossfadeWatchdog = Timer.periodic(const Duration(seconds: 1), (_) {
+    debugPrint('[Crossfade] armed for ${seconds}s window');
+    _crossfadeWatchdog = Timer.periodic(const Duration(milliseconds: 250), (_) {
       if (_crossfading) return;
+      if (!_player.playing) return;
       final dur = _player.duration;
       final pos = _player.position;
       if (dur == null || dur == Duration.zero) return;
       final remaining = dur - pos;
-      if (remaining.inMilliseconds <= seconds * 1000 + 500 &&
-          remaining.inMilliseconds > 0) {
+      // Trigger a hair before the ideal window so the fade starts
+      // before, not after, the natural end of the track.
+      if (remaining.inMilliseconds <= seconds * 1000 + 300 &&
+          remaining.inMilliseconds > 200) {
         final next = _peekNextIndex();
         if (next == null) return;
+        debugPrint('[Crossfade] triggering with ${remaining.inMilliseconds}ms left');
         _startCrossfade(toIndex: next, durationSeconds: seconds);
       }
     });

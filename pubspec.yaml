@@ -1,7 +1,7 @@
 name: melody
 description: A YouTube-powered music streamer with background playback, downloads, and offline support.
 publish_to: 'none'
-version: 0.2.2+3
+version: 0.3.0+4
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -28,8 +28,14 @@ dependencies:
   # Pinned to 3.x for the PO-token-aware extractor.
   youtube_explode_dart: ^3.1.0
 
-  # WebView fallback (Demus-style approach)
+  # WebView (used for the Browse-YouTube tab only)
   flutter_inappwebview: ^6.1.5
+
+  # Native video player for the Now Playing "video mode".
+  # We stream YouTube's video-only adaptive streams (no ads baked in)
+  # muted, and lock the audio timeline against just_audio so the two
+  # stay perfectly in sync — Demus / YMusic pattern.
+  video_player: ^2.9.5
 
   # Permissions (overlay window on Android)
   permission_handler: ^11.3.1

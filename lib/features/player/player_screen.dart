@@ -14,9 +14,8 @@ import 'queue_sheet.dart';
 import 'sleep_timer_sheet.dart';
 import 'video_view.dart';
 
-/// Last-known YouTube video position when video mode was active.
-/// Read by the toggle handler to seek the audio player on handoff.
-final _lastVideoPositionProvider = StateProvider<Duration>((_) => Duration.zero);
+// Note: video mode now uses a native video_player synced to just_audio,
+// so there's no separate video timeline to reconcile on toggle.
 
 /// Full-screen Now Playing UI: large artwork, title, scrubber, transport,
 /// and an extras row for sleep timer / queue.
@@ -51,25 +50,14 @@ class PlayerScreen extends ConsumerWidget {
                       _Header(
                         onMore: () => _showTrackMenu(context, ref, track),
                         videoMode: ref.watch(videoModeProvider),
-                        onToggleVideo: () async {
-                          final handler = ref.read(audioHandlerProvider);
+                        onToggleVideo: () {
+                          // Native video mode: the audio player stays
+                          // the master timeline the whole time; the
+                          // video is just a synced visual layer on
+                          // top. Toggling is a pure UI switch — no
+                          // pausing, seeking, or restarts.
                           final newMode = !ref.read(videoModeProvider);
-                          if (newMode) {
-                            await handler.pause();
-                            ref.read(videoModeProvider.notifier).state = true;
-                          } else {
-                            // Switch off video mode first — this disposes
-                            // VideoView which writes its last position
-                            // to _lastVideoPositionProvider via onPositionChange.
-                            ref.read(videoModeProvider.notifier).state = false;
-                            // Give the frame a chance to dispose the widget.
-                            await Future.delayed(const Duration(milliseconds: 50));
-                            final pos = ref.read(_lastVideoPositionProvider);
-                            if (pos > Duration.zero) {
-                              await handler.seek(pos);
-                            }
-                            await handler.play();
-                          }
+                          ref.read(videoModeProvider.notifier).state = newMode;
                           PipService.instance.setVideoMode(newMode);
                         },
                       ),
@@ -80,11 +68,6 @@ class PlayerScreen extends ConsumerWidget {
                               ? VideoView(
                                   key: ValueKey(track.sourceVideoId),
                                   videoId: track.sourceVideoId,
-                                  startAt: progressAsync.valueOrNull?.position ??
-                                      Duration.zero,
-                                  onPositionChange: (p) {
-                                    ref.read(_lastVideoPositionProvider.notifier).state = p;
-                                  },
                                 )
                               : AspectRatio(
                                   aspectRatio: 1,
