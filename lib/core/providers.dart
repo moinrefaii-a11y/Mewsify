@@ -147,6 +147,19 @@ final sleepTimerProvider = StreamProvider<Duration?>((ref) {
 /// as soon as the WebView loses its surface).
 final browserCurrentUrlProvider = StateProvider<String?>((_) => null);
 
+/// Live position (seconds) of the video element inside the Browse
+/// tab's WebView. Populated by a JS poller injected into every /watch
+/// page; consumed by the shell so background-hoist seeks the native
+/// audio player to the same second the user was watching.
+final browserVideoPositionProvider = StateProvider<double>((_) => 0.0);
+
+/// When the shell needs the Browse tab to seek its WebView video and
+/// resume playback (after handing native audio back on app-resume),
+/// it publishes the target seconds here. BrowserScreen watches this
+/// and issues the JS evaluate on its next frame. Set to a negative
+/// number to signal "no pending resume".
+final browserResumeSecondsProvider = StateProvider<double>((_) => -1);
+
 /// The currently playing track (or null when nothing is playing).
 final currentTrackProvider = StreamProvider<Track?>((ref) {
   final handler = ref.watch(audioHandlerProvider);

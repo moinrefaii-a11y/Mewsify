@@ -82,101 +82,144 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
   }
 
   Future<void> _applyAdSkipAndCleanup(InAppWebViewController c) async {
-    // CSS: hide the "install the YouTube app" and consent banners plus
-    // any purely-cosmetic ad overlays. We do **not** hide the
-    // html5-video-player container itself — that's what plays real
-    // content.
+    // CSS: nuke the static "sponsored" renderers plus install-app
+    // and consent banners. These are safe to hide because they're
+    // never the video player itself.
     await c.injectCSSCode(source: r'''
       ytm-mealbar-promo-renderer, ytm-consent-bump-v2-lightbox,
       ytm-privacy-tos-footer-renderer, ytm-companion-ad-renderer,
       ytm-promoted-video-renderer, ytm-promoted-sparkles-web-renderer,
+      ytm-ads-engagement-panel-content-renderer,
+      ytm-ad-slot-renderer, ytm-video-ad-renderer,
+      ytd-video-masthead-ad-v3-renderer, ytd-display-ad-renderer,
+      ytd-promoted-sparkles-web-renderer,
+      ytd-compact-promoted-video-renderer,
+      ytd-action-companion-ad-renderer,
+      ytd-banner-promo-renderer, ytd-in-feed-ad-layout-renderer,
+      ytd-ad-inline-playback-meta-block,
+      ytd-player-legacy-desktop-watch-ads-renderer,
+      ytd-ads-engagement-panel-content-renderer,
       .ytp-ad-overlay-container, .ytp-ad-image-overlay,
-      .video-ads > .ytp-ad-module {
+      .video-ads {
         display: none !important;
       }
     ''');
-    // JS: conservative ad handling. Previous version was aggressive
-    // enough to break real playback (seek-to-end + 16x fired on false
-    // positives). This version only reacts when we're **highly**
-    // confident an ad is on screen:
-    //   * The player's own `.ad-showing` class is present on the
-    //     html5-video-player element, AND
-    //   * either the `.ytp-ad-player-overlay` or `.ytp-ad-preview-*`
-    //     nodes exist (indicates a real InStream ad state).
-    // In that case: click the skip button if it's up, and *only if
-    // ad is still showing* mute the audio. No playbackRate hacks — they
-    // can freeze the video element on Android WebView.
+    // JS: proven ad-skip recipe from working YouTube ad-block
+    // bookmarklets. Two moving parts:
+    //   1. If any element on the page has the `.ad-showing` class:
+    //      seek the <video> element straight to `duration`, forcing
+    //      YouTube to advance past the ad. Also click any variant of
+    //      the "Skip Ad" button that's on screen.
+    //   2. Every 100 ms remove any static "sponsored" renderer node
+    //      (tag-name based, so YouTube can't rename its CSS classes
+    //      to defeat us).
+    // The seek-to-end trick is exactly what running production
+    // ad-block bookmarklets use. It works because YouTube's own
+    // player treats reaching duration during an ad as "ad complete"
+    // and moves to the real content.
     await c.evaluateJavascript(source: r'''
       (function() {
         if (window.__mewsifyBrowseAdSkip) return;
         window.__mewsifyBrowseAdSkip = true;
 
-        function isAdShowing() {
-          var player = document.querySelector('.html5-video-player');
-          if (!player) return false;
-          // The player element is where YouTube attaches ".ad-showing".
-          if (!player.classList.contains('ad-showing') &&
-              !player.classList.contains('ad-interrupting')) {
-            return false;
-          }
-          // Double-confirm with an in-stream overlay so a stale class
-          // doesn't fool us into muting real content.
-          return !!document.querySelector(
-            '.ytp-ad-player-overlay, .ytp-ad-preview-container, ' +
-            '.ytp-ad-player-overlay-instream-info'
-          );
-        }
+        var STATIC_AD_TAGS = [
+          'ytm-companion-ad-renderer',
+          'ytm-promoted-video-renderer',
+          'ytm-ads-engagement-panel-content-renderer',
+          'ytm-ad-slot-renderer',
+          'ytm-video-ad-renderer',
+          'ytd-video-masthead-ad-v3-renderer',
+          'ytd-display-ad-renderer',
+          'ytd-promoted-sparkles-web-renderer',
+          'ytd-compact-promoted-video-renderer',
+          'ytd-action-companion-ad-renderer',
+          'ytd-banner-promo-renderer',
+          'ytd-in-feed-ad-layout-renderer',
+          'ytd-ad-inline-playback-meta-block',
+          'ytd-player-legacy-desktop-watch-ads-renderer',
+          'ytd-ads-engagement-panel-content-renderer'
+        ];
+        var SKIP_SELECTORS = [
+          '.ytp-ad-skip-button',
+          '.ytp-ad-skip-button-modern',
+          '.ytp-skip-ad-button',
+          '.ytp-ad-skip-button-container button',
+          'button.ytp-ad-skip-button-modern',
+          '.videoAdUiSkipButton'
+        ];
 
-        function tryClickSkip() {
-          var sel = [
-            '.ytp-ad-skip-button',
-            '.ytp-ad-skip-button-modern',
-            '.ytp-skip-ad-button',
-            'button.ytp-ad-skip-button-modern',
-            '.videoAdUiSkipButton',
-          ];
-          for (var i = 0; i < sel.length; i++) {
-            var el = document.querySelector(sel[i]);
-            if (el) { try { el.click(); return true; } catch(e) {} }
-          }
-          return false;
-        }
-
-        function handleAd() {
-          var v = document.querySelector('video');
-          if (!v) return;
-          if (isAdShowing()) {
-            tryClickSkip();
-            // Mute so the ad doesn't blast the user; do not touch
-            // playbackRate (freezes video on mobile Chromium) and do
-            // not seek (would nuke real content on a false positive).
-            if (!v.muted) v.muted = true;
-          } else {
-            // Restore volume on ad end, but only if *we* muted it —
-            // don't override a user who tapped the mute button.
-            if (v.muted && !window.__mewsifyUserMuted) v.muted = false;
-          }
-        }
-
-        setInterval(handleAd, 250);
-
-        // React quickly to class changes on the player element itself
-        // (that's the one place we care about — much narrower than
-        // observing all of document.body was).
-        var player = document.querySelector('.html5-video-player');
-        if (player && window.MutationObserver) {
+        function tick() {
           try {
-            new MutationObserver(handleAd).observe(player, {
-              attributes: true, attributeFilter: ['class']
-            });
-          } catch(e) {}
+            // 1) Remove any static-ad renderers.
+            for (var i = 0; i < STATIC_AD_TAGS.length; i++) {
+              var nodes = document.getElementsByTagName(STATIC_AD_TAGS[i]);
+              for (var j = nodes.length - 1; j >= 0; j--) {
+                nodes[j].remove();
+              }
+            }
+            // 2) If an ad is showing right now: fast-forward the <video>
+            // to its own duration (which YouTube's player interprets
+            // as "ad complete") and click any skip button that's up.
+            if (document.querySelector('.ad-showing') ||
+                document.querySelector('.ad-interrupting') ||
+                document.querySelector('.ytp-ad-player-overlay')) {
+              var v = document.querySelector('video');
+              if (v && v.duration && !isNaN(v.duration)) {
+                try { v.currentTime = v.duration; } catch(e) {}
+              }
+              for (var k = 0; k < SKIP_SELECTORS.length; k++) {
+                var btn = document.querySelector(SKIP_SELECTORS[k]);
+                if (btn) { try { btn.click(); break; } catch(e) {} }
+              }
+            }
+          } catch (e) {}
         }
+
+        setInterval(tick, 100);
+        tick();
+
+        // Poll video position every 500 ms and post to Dart so the
+        // shell can seek native audio to the right spot when we hoist.
+        setInterval(function() {
+          try {
+            var v = document.querySelector('video');
+            if (v && v.currentTime > 0 && v.duration && !isNaN(v.duration)) {
+              window.flutter_inappwebview.callHandler(
+                'onBrowseVideoPos',
+                v.currentTime,
+                v.duration
+              );
+            }
+          } catch(e) {}
+        }, 500);
       })();
     ''');
   }
 
   @override
   Widget build(BuildContext context) {
+    // Listen for resume-video requests from the shell (on app resume
+    // after a background-hoist). Seek the WebView's <video> to the
+    // requested second and start playing, so the user's browsing
+    // experience picks up exactly where the audio was.
+    ref.listen<double>(browserResumeSecondsProvider, (_, next) async {
+      if (next < 0) return;
+      // Consume the signal so we don't refire on rebuild.
+      ref.read(browserResumeSecondsProvider.notifier).state = -1;
+      final controller = _controller;
+      if (controller == null) return;
+      try {
+        await controller.evaluateJavascript(source: '''
+          (function() {
+            var v = document.querySelector('video');
+            if (!v) return;
+            try { v.currentTime = $next; } catch(e) {}
+            try { v.play(); } catch(e) {}
+          })();
+        ''');
+      } catch (_) {}
+    });
+
     return SafeArea(
       child: Column(
         children: [
@@ -219,7 +262,23 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
                 allowsInlineMediaPlayback: true,
                 useShouldOverrideUrlLoading: false,
               ),
-              onWebViewCreated: (controller) => _controller = controller,
+              onWebViewCreated: (controller) {
+                _controller = controller;
+                // Receive position updates from the injected poller so
+                // the shell can seek native audio to the correct spot
+                // when we hoist on background.
+                controller.addJavaScriptHandler(
+                  handlerName: 'onBrowseVideoPos',
+                  callback: (args) {
+                    if (args.isNotEmpty && args.first is num) {
+                      final pos = (args.first as num).toDouble();
+                      ref.read(browserVideoPositionProvider.notifier).state =
+                          pos;
+                    }
+                    return null;
+                  },
+                );
+              },
               onLoadStart: (_, uri) {
                 _currentUri = uri;
                 ref.read(browserCurrentUrlProvider.notifier).state =

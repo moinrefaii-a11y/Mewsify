@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -56,17 +58,22 @@ class _MainShellState extends ConsumerState<MainShell>
   /// tiny lifecycle transition (Android emits inactive→paused→inactive
   /// repeatedly on some devices).
   String? _lastHoistedId;
+  double _hoistedFromSeconds = 0.0;
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (kIsWeb) return;
+    // App coming back to the foreground: hand audio back to the
+    // WebView if the user was actively watching in the Browse tab and
+    // we hoisted while they were away.
+    if (state == AppLifecycleState.resumed) {
+      _maybeReturnToBrowse();
+      return;
+    }
     // Fire on `inactive` — a hair earlier than `paused` — so audio
-    // never gaps as the WebView loses its surface. On Android `inactive`
-    // fires ~150 ms before `paused`.
+    // never gaps as the WebView loses its surface.
     if (state != AppLifecycleState.inactive &&
         state != AppLifecycleState.paused) {
-      // Coming back to the foreground: allow future hoists again.
-      if (state == AppLifecycleState.resumed) _lastHoistedId = null;
       return;
     }
     if (_index != _browseTabIndex) return;
@@ -80,28 +87,33 @@ class _MainShellState extends ConsumerState<MainShell>
     }
     final id = _extractVideoId(uri);
     if (id == null) return;
-    if (_lastHoistedId == id) return; // already hoisted this session
+    if (_lastHoistedId == id) return;
     _lastHoistedId = id;
-    _hoistToNative(id);
+    _hoistedFromSeconds = ref.read(browserVideoPositionProvider);
+    _hoistToNative(id, _hoistedFromSeconds);
   }
 
-  Future<void> _hoistToNative(String videoId) async {
+  Future<void> _hoistToNative(String videoId, double fromSeconds) async {
     final currentTrack = ref.read(currentTrackProvider).valueOrNull;
     if (currentTrack != null && currentTrack.sourceVideoId == videoId) return;
     try {
       final yt = ref.read(youtubeSourceProvider);
-      // Kick the audio URL cache immediately (it's likely already warm
-      // from the browser's prewarm call, but harmless if not).
       yt.prewarmAudioUrl(videoId);
       final track = await yt.getTrack(videoId);
-      await ref.read(audioHandlerProvider).playWithAutoplay(track);
+      final handler = ref.read(audioHandlerProvider);
+      await handler.playWithAutoplay(track);
+      // Seek to the WebView video's last known second so background
+      // audio picks up exactly where the video paused.
+      if (fromSeconds > 1.0) {
+        await handler.seek(Duration(milliseconds: (fromSeconds * 1000).round()));
+      }
       await ref.read(libraryProvider).recordPlay(track);
       if (mounted) {
         ScaffoldMessenger.of(context)
           ..hideCurrentSnackBar()
           ..showSnackBar(
             SnackBar(
-              content: Text('Continuing "${track.title}" in background'),
+              content: Text('Playing "${track.title}" in background'),
               duration: const Duration(seconds: 3),
               behavior: SnackBarBehavior.floating,
             ),
@@ -110,6 +122,56 @@ class _MainShellState extends ConsumerState<MainShell>
     } catch (e) {
       debugPrint('[BackgroundHoist] failed: $e');
     }
+  }
+
+  /// Called on resume. If we hoisted a WebView video into native audio
+  /// while the app was away and the user came back to the Browse tab,
+  /// hand playback back to the WebView so their visual experience is
+  /// uninterrupted. We seek the WebView video to native audio's
+  /// current second, tell it to play, then pause native audio.
+  Future<void> _maybeReturnToBrowse() async {
+    final hoistedId = _lastHoistedId;
+    _lastHoistedId = null; // allow another hoist next background
+    if (hoistedId == null) return;
+    if (_index != _browseTabIndex) return;
+    final handler = ref.read(audioHandlerProvider);
+    final current = handler.currentTrack;
+    if (current == null || current.sourceVideoId != hoistedId) return;
+
+    // Where should the video jump back to? Take native audio's live
+    // position; that's the exact moment the user is hearing right now.
+    final resumeSec =
+        handler.rawPlayer.position.inMilliseconds / 1000.0;
+
+    // Fire the JS but don't block on it — we want the pause + snackbar
+    // to happen even if the browser is slow to respond.
+    unawaited(_seekBrowserVideoAndPlay(resumeSec));
+
+    // Small delay so the WebView has a beat to start decoding before
+    // we cut native audio — avoids an audible gap.
+    await Future.delayed(const Duration(milliseconds: 300));
+    try {
+      await handler.pause();
+    } catch (_) {}
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(
+            content: Text('Resumed video in Browse'),
+            duration: Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+    }
+  }
+
+  Future<void> _seekBrowserVideoAndPlay(double seconds) async {
+    // We can't reach into BrowserScreen's InAppWebViewController from
+    // here — the shell isn't the WebView owner. Publish the desired
+    // resume position via a provider; BrowserScreen listens and does
+    // the JS eval on its next frame.
+    ref.read(browserResumeSecondsProvider.notifier).state = seconds;
   }
 
   String? _extractVideoId(Uri uri) {
