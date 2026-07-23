@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -75,8 +77,9 @@ class _ArtistScreenState extends ConsumerState<ArtistScreen> {
           return CustomScrollView(
             slivers: [
               SliverAppBar(
-                expandedHeight: 320,
+                expandedHeight: 340,
                 pinned: true,
+                stretch: true,
                 backgroundColor: Theme.of(context).colorScheme.surface,
                 flexibleSpace: FutureBuilder<ChannelMeta?>(
                   future: _channelMetaFuture,
@@ -189,100 +192,162 @@ class _ArtistHero extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return FlexibleSpaceBar(
-      title: Text(
-        name,
-        style: const TextStyle(
-          color: Colors.white,
-          fontWeight: FontWeight.w800,
-        ),
-      ),
-      titlePadding: const EdgeInsetsDirectional.only(start: 56, bottom: 16, end: 16),
-      centerTitle: false,
-      background: FutureBuilder<MelodyPalette>(
-        future: imageUrl.isEmpty
-            ? Future.value(const MelodyPalette(
-                primary: Color(0xFF1DB954),
-                secondary: Color(0xFF0F0F10),
-                text: Colors.white,
-              ))
-            : PaletteService.instance.getPalette(imageUrl),
-        builder: (context, snap) {
-          final palette = snap.data;
-          return Stack(
-            fit: StackFit.expand,
-            children: [
-              // Tinted gradient backdrop derived from the artwork.
-              DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      palette?.primary ?? const Color(0xFF1DB954),
-                      Theme.of(context).colorScheme.surface,
-                    ],
-                  ),
-                ),
+    // LayoutBuilder lets us compute how "collapsed" the header is so
+    // we can fade the big centred avatar out and the pinned title in
+    // as the user scrolls up — the Spotify parallax-collapse feel.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final settings = context
+            .dependOnInheritedWidgetOfExactType<FlexibleSpaceBarSettings>();
+        final deltaExtent = (settings?.maxExtent ?? 340) -
+            (settings?.minExtent ?? kToolbarHeight);
+        final current = (settings?.currentExtent ?? 340) -
+            (settings?.minExtent ?? kToolbarHeight);
+        // 1.0 = fully expanded, 0.0 = collapsed.
+        final t = deltaExtent <= 0 ? 0.0 : (current / deltaExtent).clamp(0.0, 1.0);
+
+        return FlexibleSpaceBar(
+          title: Opacity(
+            // Title only appears once we're mostly collapsed.
+            opacity: (1 - t).clamp(0.0, 1.0) > 0.6
+                ? ((1 - t) - 0.6) / 0.4
+                : 0.0,
+            child: Text(
+              name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w800,
               ),
-              // Centered artist avatar + optional subscriber caption.
-              Padding(
-                padding: const EdgeInsets.only(top: 60, bottom: 44),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.start,
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    Container(
-                      decoration: const BoxDecoration(
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                              color: Colors.black54,
-                              blurRadius: 24,
-                              offset: Offset(0, 8)),
-                        ],
-                      ),
-                      child: ClipOval(
-                        child: imageUrl.isEmpty
-                            ? Container(
-                                width: 160,
-                                height: 160,
-                                color: Colors.black26,
-                                child: const Icon(Icons.person,
-                                    size: 64, color: Colors.white70),
-                              )
-                            : CachedNetworkImage(
-                                imageUrl: imageUrl,
-                                width: 160,
-                                height: 160,
-                                fit: BoxFit.cover,
-                                errorWidget: (_, __, ___) => Container(
-                                  width: 160,
-                                  height: 160,
-                                  color: Colors.black26,
-                                  child: const Icon(Icons.person, size: 64),
-                                ),
-                              ),
-                      ),
-                    ),
-                    if (_subCaption() != null) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        _subCaption()!,
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
+            ),
+          ),
+          titlePadding:
+              const EdgeInsetsDirectional.only(start: 56, bottom: 16, end: 16),
+          centerTitle: false,
+          background: FutureBuilder<MelodyPalette>(
+            future: imageUrl.isEmpty
+                ? Future.value(const MelodyPalette(
+                    primary: Color(0xFF1DB954),
+                    secondary: Color(0xFF0F0F10),
+                    text: Colors.white,
+                  ))
+                : PaletteService.instance.getPalette(imageUrl),
+            builder: (context, snap) {
+              final palette = snap.data;
+              final surface = Theme.of(context).colorScheme.surface;
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  // 1) Blurred artwork fills the whole header (parallax
+                  //    hero), tinted down so text stays legible.
+                  if (imageUrl.isNotEmpty)
+                    Transform.scale(
+                      // Slight over-scale + shift for a parallax feel as
+                      // the header collapses.
+                      scale: 1.1 + (1 - t) * 0.15,
+                      child: ImageFiltered(
+                        imageFilter:
+                            ui.ImageFilter.blur(sigmaX: 28, sigmaY: 28),
+                        child: CachedNetworkImage(
+                          imageUrl: imageUrl,
+                          fit: BoxFit.cover,
+                          errorWidget: (_, __, ___) =>
+                              const SizedBox.shrink(),
                         ),
                       ),
-                    ],
-                  ],
-                ),
-              ),
-            ],
-          );
-        },
-      ),
+                    ),
+                  // 2) Palette gradient scrim → fades into the page bg.
+                  DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          (palette?.primary ?? const Color(0xFF1DB954))
+                              .withValues(alpha: 0.55),
+                          surface.withValues(alpha: 0.55),
+                          surface,
+                        ],
+                        stops: const [0.0, 0.6, 1.0],
+                      ),
+                    ),
+                  ),
+                  // 3) Centred avatar + caption, fading out as we scroll.
+                  Opacity(
+                    opacity: t,
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 56, bottom: 46),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.start,
+                        children: [
+                          Container(
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                    color: Colors.black54,
+                                    blurRadius: 28,
+                                    offset: Offset(0, 10)),
+                              ],
+                            ),
+                            child: ClipOval(
+                              child: imageUrl.isEmpty
+                                  ? Container(
+                                      width: 156,
+                                      height: 156,
+                                      color: Colors.black26,
+                                      child: const Icon(Icons.person,
+                                          size: 64, color: Colors.white70),
+                                    )
+                                  : CachedNetworkImage(
+                                      imageUrl: imageUrl,
+                                      width: 156,
+                                      height: 156,
+                                      fit: BoxFit.cover,
+                                      errorWidget: (_, __, ___) => Container(
+                                        width: 156,
+                                        height: 156,
+                                        color: Colors.black26,
+                                        child:
+                                            const Icon(Icons.person, size: 64),
+                                      ),
+                                    ),
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 24,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: -0.5,
+                            ),
+                          ),
+                          if (_subCaption() != null) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              _subCaption()!,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        );
+      },
     );
   }
 }

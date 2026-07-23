@@ -47,17 +47,6 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
     SearchCategory.artists,
   ];
 
-  static const _suggestions = [
-    'Top hits 2026',
-    'Lo-fi beats',
-    'Bollywood new',
-    'Acoustic covers',
-    'Workout playlist',
-    'Hindi songs',
-    'Tamil hits',
-    'Punjabi music',
-  ];
-
   Box<String> get _recentSearches =>
       Hive.box<String>('recent_searches');
 
@@ -422,7 +411,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
             Padding(
               padding: const EdgeInsets.only(bottom: 12, top: 8),
               child: Text(
-                'SUGGESTED',
+                'BROWSE ALL',
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w800,
@@ -431,19 +420,98 @@ class _SearchScreenState extends ConsumerState<SearchScreen>
                 ),
               ),
             ),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: _suggestions.map((s) {
-                return ActionChip(
-                  label: Text(s),
-                  onPressed: () => _runSuggestion(s),
+            // Spotify-style colourful category grid.
+            GridView.count(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              crossAxisCount: 2,
+              mainAxisSpacing: 12,
+              crossAxisSpacing: 12,
+              childAspectRatio: 1.7,
+              children: _browseCategories.map((c) {
+                return _BrowseCard(
+                  category: c,
+                  onTap: () => _runSuggestion(c.query),
                 );
               }).toList(),
             ),
           ],
         );
       },
+    );
+  }
+
+  static const _browseCategories = <_BrowseCategory>[
+    _BrowseCategory('Pop', Color(0xFFE91E63), 'top pop hits 2026'),
+    _BrowseCategory('Hip-Hop', Color(0xFF7E57C2), 'hip hop hits 2026'),
+    _BrowseCategory('Bollywood', Color(0xFFFF7043), 'bollywood new songs 2026'),
+    _BrowseCategory('Lo-fi', Color(0xFF26A69A), 'lofi chill beats'),
+    _BrowseCategory('Workout', Color(0xFFEF5350), 'workout gym music'),
+    _BrowseCategory('Chill', Color(0xFF42A5F5), 'chill music playlist'),
+    _BrowseCategory('Punjabi', Color(0xFFD81B60), 'punjabi hit songs'),
+    _BrowseCategory('Tamil', Color(0xFFF4511E), 'tamil hit songs'),
+    _BrowseCategory('Telugu', Color(0xFF5C6BC0), 'telugu hit songs'),
+    _BrowseCategory('Rock', Color(0xFFFFA726), 'rock hits'),
+    _BrowseCategory('R&B', Color(0xFFAB47BC), 'rnb soul hits'),
+    _BrowseCategory('Party', Color(0xFF66BB6A), 'party dance hits 2026'),
+  ];
+}
+
+class _BrowseCategory {
+  final String name;
+  final Color color;
+  final String query;
+  const _BrowseCategory(this.name, this.color, this.query);
+}
+
+class _BrowseCard extends StatelessWidget {
+  final _BrowseCategory category;
+  final VoidCallback onTap;
+  const _BrowseCard({required this.category, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              category.color,
+              Color.lerp(category.color, Colors.black, 0.42)!,
+            ],
+          ),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Text(
+              category.name,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            Positioned(
+              right: -8,
+              bottom: -10,
+              child: Transform.rotate(
+                angle: 0.4,
+                child: Icon(
+                  Icons.music_note_rounded,
+                  size: 46,
+                  color: Colors.black.withValues(alpha: 0.22),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

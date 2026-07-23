@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -181,8 +183,18 @@ class _BlurredBackdrop extends StatefulWidget {
   State<_BlurredBackdrop> createState() => _BlurredBackdropState();
 }
 
-class _BlurredBackdropState extends State<_BlurredBackdrop> {
+class _BlurredBackdropState extends State<_BlurredBackdrop>
+    with SingleTickerProviderStateMixin {
   late Future<MelodyPalette> _paletteFuture;
+
+  // Slow "canvas" drift — a heavily-blurred copy of the album art
+  // gently pans + zooms behind the palette gradient, so the player
+  // feels alive like Spotify's Canvas without the cost/risk of playing
+  // a real looping video. One controller, GPU transforms only.
+  late final AnimationController _drift = AnimationController(
+    vsync: this,
+    duration: const Duration(seconds: 18),
+  )..repeat(reverse: true);
 
   @override
   void initState() {
@@ -199,32 +211,86 @@ class _BlurredBackdropState extends State<_BlurredBackdrop> {
   }
 
   @override
+  void dispose() {
+    _drift.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final base = Theme.of(context).colorScheme.surface;
     return FutureBuilder<MelodyPalette>(
       future: _paletteFuture,
       builder: (context, snap) {
         final palette = snap.data;
-        return AnimatedContainer(
-          duration: const Duration(milliseconds: 600),
-          curve: Curves.easeOut,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              stops: const [0.0, 0.5, 1.0],
-              colors: [
-                palette?.primary ?? base,
-                Color.lerp(palette?.secondary ?? base, base, 0.4) ?? base,
-                base,
-              ],
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            // Drifting blurred artwork "canvas".
+            if (widget.url.isNotEmpty)
+              AnimatedBuilder(
+                animation: _drift,
+                builder: (context, child) {
+                  final t = Curves.easeInOut.transform(_drift.value);
+                  return Transform.scale(
+                    scale: 1.3 + t * 0.15,
+                    child: Transform.translate(
+                      offset: Offset((t - 0.5) * 30, (t - 0.5) * 40),
+                      child: child,
+                    ),
+                  );
+                },
+                child: ImageFiltered(
+                  imageFilter: ui.ImageFilter.blur(sigmaX: 40, sigmaY: 40),
+                  child: CachedNetworkImage(
+                    imageUrl: widget.url,
+                    fit: BoxFit.cover,
+                    errorWidget: (_, __, ___) => const SizedBox.shrink(),
+                  ),
+                ),
+              ),
+            // Palette gradient scrim on top — tints the canvas to the
+            // dominant color and fades into the page background so the
+            // controls stay readable.
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 600),
+              curve: Curves.easeOut,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  stops: const [0.0, 0.45, 1.0],
+                  colors: [
+                    (palette?.primary ?? base).withValues(alpha: 0.72),
+                    Color.lerp(palette?.secondary ?? base, base, 0.4)
+                            ?.withValues(alpha: 0.88) ??
+                        base,
+                    base,
+                  ],
+                ),
+              ),
             ),
-          ),
+          ],
         );
       },
     );
   }
 }
+
+/// Riverpod: the dominant-color palette of the currently playing
+/// track's artwork. The player controls tint themselves to this so the
+/// whole Now Playing screen is color-adaptive like Spotify / Apple.
+final playerAccentProvider =
+    FutureProvider.family<MelodyPalette, String>((ref, url) {
+  if (url.isEmpty) {
+    return const MelodyPalette(
+      primary: Color(0xFF1DB954),
+      secondary: Color(0xFF0F0F10),
+      text: Colors.white,
+    );
+  }
+  return PaletteService.instance.getPalette(url);
+});
 
 class _Header extends StatelessWidget {
   final VoidCallback onMore;
@@ -404,12 +470,26 @@ class _ScrubberState extends ConsumerState<_Scrubber> {
         ? pos
         : Duration(milliseconds: (_dragValue! * dur.inMilliseconds).round());
 
+    // Color-adaptive scrubber — active track tints to the artwork.
+    final track = ref.watch(currentTrackProvider).valueOrNull;
+    Color? accent;
+    if (track != null && track.thumbnailUrl.isNotEmpty) {
+      final pal = ref.watch(playerAccentProvider(track.thumbnailUrl)).valueOrNull;
+      if (pal != null) {
+        final c = pal.primary;
+        final lum = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+        accent = lum < 0.18 ? Color.lerp(c, Colors.white, 0.35) : c;
+      }
+    }
+
     return Column(
       children: [
         SliderTheme(
           data: SliderTheme.of(context).copyWith(
             trackHeight: 3,
             thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+            activeTrackColor: accent,
+            thumbColor: accent,
           ),
           child: Slider(
             value: value,
@@ -483,12 +563,22 @@ class _TransportState extends ConsumerState<_Transport>
     final shuffle = ref.watch(shuffleModeProvider).valueOrNull ?? false;
     final repeat = ref.watch(repeatModeProvider).valueOrNull ?? PlaybackRepeat.off;
 
+    // Color-adaptive accent: the big play button tints to the artwork's
+    // dominant color (Spotify signature). Falls back to theme primary.
+    final track = ref.watch(currentTrackProvider).valueOrNull;
+    MelodyPalette? palette;
+    if (track != null && track.thumbnailUrl.isNotEmpty) {
+      palette = ref.watch(playerAccentProvider(track.thumbnailUrl)).valueOrNull;
+    }
+    final accent = _readableAccent(palette?.primary, scheme.primary);
+    final onAccent = _isLight(accent) ? Colors.black : Colors.white;
+
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
         IconButton(
           iconSize: 24,
-          color: shuffle ? scheme.primary : null,
+          color: shuffle ? accent : null,
           icon: const Icon(Icons.shuffle),
           onPressed: widget.handler.toggleShuffle,
         ),
@@ -498,11 +588,11 @@ class _TransportState extends ConsumerState<_Transport>
           onPressed: widget.handler.skipToPrevious,
         ),
         Container(
-          decoration: BoxDecoration(color: scheme.primary, shape: BoxShape.circle),
+          decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
           padding: const EdgeInsets.all(10),
           child: IconButton(
             iconSize: 38,
-            color: scheme.onPrimary,
+            color: onAccent,
             icon: AnimatedIcon(
               icon: AnimatedIcons.play_pause,
               progress: _playAnim,
@@ -519,13 +609,28 @@ class _TransportState extends ConsumerState<_Transport>
         ),
         IconButton(
           iconSize: 24,
-          color: repeat == PlaybackRepeat.off ? null : scheme.primary,
+          color: repeat == PlaybackRepeat.off ? null : accent,
           icon: Icon(_repeatIcon(repeat)),
           onPressed: widget.handler.cycleRepeat,
         ),
       ],
     );
   }
+
+  /// Nudge very dark / very light palette colors toward something with
+  /// enough contrast against the dark player to be a usable button.
+  Color _readableAccent(Color? c, Color fallback) {
+    if (c == null) return fallback;
+    final lum = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+    if (lum < 0.18) {
+      // Too dark — lighten toward the fallback.
+      return Color.lerp(c, Colors.white, 0.35) ?? fallback;
+    }
+    return c;
+  }
+
+  bool _isLight(Color c) =>
+      (0.299 * c.r + 0.587 * c.g + 0.114 * c.b) > 0.65;
 
   IconData _repeatIcon(PlaybackRepeat m) {
     switch (m) {
