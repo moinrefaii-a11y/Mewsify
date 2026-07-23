@@ -1,7 +1,7 @@
 name: melody
 description: A YouTube-powered music streamer with background playback, downloads, and offline support.
 publish_to: 'none'
-version: 0.8.0+19
+version: 0.9.0+20
 
 environment:
   sdk: ">=3.3.0 <4.0.0"

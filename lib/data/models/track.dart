@@ -46,6 +46,20 @@ class Track {
         addedAt: addedAt ?? this.addedAt,
       );
 
+  /// Return a copy with a resolved [duration]. Used by the audio
+  /// handler once just_audio reports the real stream length so the
+  /// queue entry (and lock-screen / Bluetooth metadata) is accurate.
+  Track copyWithDuration(Duration duration) => Track(
+        id: id,
+        title: title,
+        artist: artist,
+        album: album,
+        thumbnailUrl: thumbnailUrl,
+        duration: duration,
+        sourceVideoId: sourceVideoId,
+        addedAt: addedAt,
+      );
+
   /// audio_service representation, surfaced on lock screen and notifications.
   MediaItem toMediaItem() => MediaItem(
         id: id,

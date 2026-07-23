@@ -3,25 +3,23 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_native_splash/flutter_native_splash.dart';
 
-/// Studio-grade launch splash for MewSify.
+/// Premium launch splash for MewSify.
 ///
-/// 3.2 s of coordinated motion driven by ONE AnimationController:
+/// Design goal: clean, confident, "expensive-feeling" — closer to
+/// Apple Music / Spotify launch than a busy animation. One
+/// AnimationController drives the whole 2.6 s sequence. The only
+/// moving painter work is a single cheap `Transform.rotate` of a conic
+/// gradient (GPU transform, not a repainting CustomPaint), so it stays
+/// buttery even on low-end devices.
 ///
-///   0.00 – 0.30s   Radial vignette + diagonal sheen sweep across bg.
-///   0.15 – 1.00s   Seven equalizer bars rise into the gradient tile,
-///                  each with its own stagger + overshoot easing.
-///   0.85 – 1.30s   Tile scales in and a soft green glow blooms.
-///   1.05 – 2.60s   Three concentric ripple rings pulse outward from
-///                  the tile — the "sound-wave" motion that reads as
-///                  "music", not a generic app splash.
-///   1.20 – 1.90s   "MewSify" wordmark reveals **one letter at a time**
-///                  with a soft slide-up + fade per letter.
-///   1.80 – 2.20s   Tagline fades in.
-///   2.05 – 2.45s   "Created with ❤ by MOIN" credit fades in.
-///   2.90 – 3.20s   Whole overlay dissolves out.
-///
-/// Everything renders inside a single RepaintBoundary + one Ticker —
-/// one paint call per frame regardless of complexity.
+/// Timeline:
+///   0.00–0.55s  Disc springs in (scale + fade) while a soft conic
+///               sheen rotates behind it, like light catching vinyl.
+///   0.35–0.80s  The play-triangle glyph fades in at the disc centre.
+///   0.55–0.95s  Wordmark rises + fades.
+///   0.80–1.15s  Tagline fades.
+///   0.30–2.20s  A thin accent progress line sweeps across the bottom.
+///   2.30–2.60s  Whole overlay dissolves to reveal the app.
 class SplashOverlay extends StatefulWidget {
   final Widget child;
   const SplashOverlay({super.key, required this.child});
@@ -34,65 +32,39 @@ class _SplashOverlayState extends State<SplashOverlay>
     with SingleTickerProviderStateMixin {
   late final AnimationController _c = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 3200),
+    duration: const Duration(milliseconds: 2600),
   );
 
-  // Bars rise 0.15-1.00s (relative: 0.047-0.313)
-  late final Animation<double> _barsAppear = CurvedAnimation(
-    parent: _c,
-    curve: const Interval(0.047, 0.313, curve: Curves.easeOutCubic),
-  );
-
-  // Tile scale + overshoot 0.85-1.30s (0.266-0.406)
-  late final Animation<double> _tileScale = TweenSequence<double>([
+  late final Animation<double> _discScale = TweenSequence<double>([
     TweenSequenceItem(
-      tween: Tween(begin: 0.82, end: 1.06)
+      tween: Tween(begin: 0.6, end: 1.05)
           .chain(CurveTween(curve: Curves.easeOutBack)),
-      weight: 35,
+      weight: 55,
     ),
     TweenSequenceItem(
-      tween: Tween(begin: 1.06, end: 1.0)
+      tween: Tween(begin: 1.05, end: 1.0)
           .chain(CurveTween(curve: Curves.easeOutCubic)),
-      weight: 20,
+      weight: 25,
     ),
-    TweenSequenceItem(tween: ConstantTween(1.0), weight: 45),
+    TweenSequenceItem(tween: ConstantTween(1.0), weight: 100),
   ]).animate(_c);
 
-  late final Animation<double> _tileGlow = CurvedAnimation(
-    parent: _c,
-    curve: const Interval(0.30, 0.55, curve: Curves.easeOutCubic),
-  );
-
-  // Ripples run 1.05-2.60s (0.328-0.813) — plenty of time for three
-  // staggered rings to complete their outward pulse.
-  late final Animation<double> _ripplePhase = CurvedAnimation(
-    parent: _c,
-    curve: const Interval(0.328, 0.813),
-  );
-
-  // Wordmark letters 1.20-1.90s (0.375-0.594)
-  late final Animation<double> _wordmarkPhase = CurvedAnimation(
-    parent: _c,
-    curve: const Interval(0.375, 0.594),
-  );
-
-  late final Animation<double> _taglineOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.563, 0.688));
-  late final Animation<double> _creditOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.641, 0.766));
-
-  late final Animation<double> _overlayFade = Tween<double>(
-    begin: 1.0,
-    end: 0.0,
-  ).animate(CurvedAnimation(
-    parent: _c,
-    curve: const Interval(0.906, 1.0, curve: Curves.easeIn),
-  ));
-
-  late final Animation<double> _sheenT = CurvedAnimation(
-    parent: _c,
-    curve: const Interval(0.0, 0.28, curve: Curves.easeInOut),
-  );
+  late final Animation<double> _discFade =
+      CurvedAnimation(parent: _c, curve: const Interval(0.0, 0.22));
+  late final Animation<double> _glyphFade =
+      CurvedAnimation(parent: _c, curve: const Interval(0.13, 0.32));
+  late final Animation<double> _wordFade =
+      CurvedAnimation(parent: _c, curve: const Interval(0.21, 0.38));
+  late final Animation<double> _wordRise = Tween<double>(begin: 18, end: 0)
+      .animate(CurvedAnimation(
+          parent: _c, curve: const Interval(0.21, 0.40, curve: Curves.easeOutCubic)));
+  late final Animation<double> _tagFade =
+      CurvedAnimation(parent: _c, curve: const Interval(0.31, 0.46));
+  late final Animation<double> _barSweep =
+      CurvedAnimation(parent: _c, curve: const Interval(0.12, 0.85, curve: Curves.easeInOut));
+  late final Animation<double> _fadeOut = Tween<double>(begin: 1, end: 0)
+      .animate(CurvedAnimation(
+          parent: _c, curve: const Interval(0.88, 1.0, curve: Curves.easeIn)));
 
   bool _done = false;
 
@@ -120,88 +92,81 @@ class _SplashOverlayState extends State<SplashOverlay>
       children: [
         widget.child,
         FadeTransition(
-          opacity: _overlayFade,
+          opacity: _fadeOut,
           child: IgnorePointer(
             child: RepaintBoundary(
               child: AnimatedBuilder(
                 animation: _c,
-                builder: (context, _) => Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    const DecoratedBox(
-                      decoration: BoxDecoration(
-                        gradient: RadialGradient(
-                          center: Alignment.center,
-                          radius: 1.4,
-                          colors: [
-                            Color(0xFF12181D),
-                            Color(0xFF040608),
+                builder: (context, _) => DecoratedBox(
+                  decoration: const BoxDecoration(
+                    gradient: RadialGradient(
+                      center: Alignment(0, -0.15),
+                      radius: 1.25,
+                      colors: [Color(0xFF16201C), Color(0xFF050707)],
+                    ),
+                  ),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      // Disc + glyph
+                      Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Spacer(flex: 3),
+                            Opacity(
+                              opacity: _discFade.value,
+                              child: Transform.scale(
+                                scale: _discScale.value,
+                                child: _Disc(
+                                  rotation: _c.value * 2 * math.pi,
+                                  glyphOpacity: _glyphFade.value,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 32),
+                            Opacity(
+                              opacity: _wordFade.value,
+                              child: Transform.translate(
+                                offset: Offset(0, _wordRise.value),
+                                child: const Text(
+                                  'MewSify',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 36,
+                                    fontWeight: FontWeight.w800,
+                                    letterSpacing: -0.5,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Opacity(
+                              opacity: _tagFade.value,
+                              child: const Text(
+                                'YOUR MUSIC · YOUR VIBE',
+                                style: TextStyle(
+                                  color: Color(0x80FFFFFF),
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: 3.4,
+                                ),
+                              ),
+                            ),
+                            const Spacer(flex: 3),
+                            // Thin sweeping progress line.
+                            _ProgressLine(t: _barSweep.value),
+                            const SizedBox(height: 28),
+                            Opacity(
+                              opacity: _tagFade.value * 0.9,
+                              child: const _Credit(),
+                            ),
+                            const SizedBox(height: 40),
                           ],
                         ),
                       ),
-                    ),
-                    _Sheen(t: _sheenT.value),
-                    Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          SizedBox(
-                            width: 320,
-                            height: 320,
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                // Concentric sound-wave ripples behind
-                                // the logo — the "musical" touch.
-                                CustomPaint(
-                                  size: const Size(320, 320),
-                                  painter: _RipplePainter(
-                                    phase: _ripplePhase.value,
-                                  ),
-                                ),
-                                // Gradient tile with rising bars inside.
-                                Transform.scale(
-                                  scale: _tileScale.value,
-                                  child: _LogoTile(
-                                    barsProgress: _barsAppear.value,
-                                    settle: _c.value,
-                                    glow: _tileGlow.value,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 22),
-                          // Letter-by-letter wordmark reveal.
-                          _StaggeredWordmark(phase: _wordmarkPhase.value),
-                          const SizedBox(height: 12),
-                          Opacity(
-                            opacity: _taglineOpacity.value,
-                            child: const Text(
-                              'YOUR MUSIC   ·   YOUR VIBE',
-                              style: TextStyle(
-                                color: Color(0x88FFFFFF),
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: 3.6,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Positioned(
-                      left: 0,
-                      right: 0,
-                      bottom: 52,
-                      child: Center(
-                        child: Opacity(
-                          opacity: _creditOpacity.value,
-                          child: const _Credit(),
-                        ),
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -212,193 +177,124 @@ class _SplashOverlayState extends State<SplashOverlay>
   }
 }
 
-/// The gradient logo tile with the equalizer bars painted inside.
-class _LogoTile extends StatelessWidget {
-  final double barsProgress;
-  final double settle;
-  final double glow;
-  const _LogoTile({
-    required this.barsProgress,
-    required this.settle,
-    required this.glow,
-  });
+/// A glossy disc: green→teal gradient fill, a rotating conic sheen for
+/// the "light on vinyl" effect, a dark centre label, and a play glyph.
+class _Disc extends StatelessWidget {
+  final double rotation;
+  final double glyphOpacity;
+  const _Disc({required this.rotation, required this.glyphOpacity});
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return SizedBox(
       width: 132,
       height: 132,
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFF1DE97C), Color(0xFF0AA0AF)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(32),
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0xFF1DE97C).withValues(alpha: 0.18 + glow * 0.42),
-            blurRadius: 32 + glow * 48,
-            spreadRadius: -6 + glow * 8,
-            offset: const Offset(0, 16),
-          ),
-        ],
-      ),
-      child: Center(
-        child: CustomPaint(
-          size: const Size(74, 74),
-          painter: _EqBarsPainter(
-            appear: barsProgress,
-            settle: settle,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _EqBarsPainter extends CustomPainter {
-  final double appear;
-  final double settle;
-  _EqBarsPainter({required this.appear, required this.settle});
-
-  static const _target = [0.42, 0.62, 0.86, 1.0, 0.86, 0.62, 0.42];
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = Colors.white;
-    const barCount = 7;
-    final barWidth = size.width / (barCount * 2 - 1);
-    final gap = barWidth;
-
-    for (var i = 0; i < barCount; i++) {
-      final localT = ((appear - i * 0.05) / 0.6).clamp(0.0, 1.0);
-      final eased = Curves.easeOutBack.transform(localT);
-      final breatheAmp = appear >= 1.0 ? 0.06 : 0.0;
-      final breathe = math.sin(
-              (settle * 2 * math.pi * 1.4) + (i * 0.55)) *
-          breatheAmp;
-      final targetH = _target[i] + breathe;
-      final h = (targetH * eased).clamp(0.0, 1.0) * size.height;
-      final x = i * (barWidth + gap);
-      final y = (size.height - h) / 2;
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(
-          Rect.fromLTWH(x, y, barWidth, h),
-          Radius.circular(barWidth / 2),
-        ),
-        paint,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _EqBarsPainter old) =>
-      old.appear != appear || old.settle != settle;
-}
-
-/// Three concentric rings that pulse outward from the tile — the
-/// classic "sound-wave" motif. Staggered so at any moment there's a
-/// visible ring somewhere in the sequence. Fades to zero opacity as
-/// each ring expands.
-class _RipplePainter extends CustomPainter {
-  final double phase; // 0..1
-  _RipplePainter({required this.phase});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (phase <= 0.0) return;
-    final center = size.center(Offset.zero);
-    for (var i = 0; i < 3; i++) {
-      // Each ring's own 0..1 progression, staggered by 1/3 of a cycle.
-      var t = (phase * 3 + i / 3) % 1.0;
-      // Only show the ring during its "outward" half.
-      if (t < 0.05) continue;
-      final eased = Curves.easeOutCubic.transform(t);
-      final radius = 70 + eased * 90;
-      final opacity = (1.0 - t) * 0.35;
-      final stroke = 2.4 - (t * 1.6);
-      final paint = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = stroke.clamp(0.4, 2.4)
-        ..color = const Color(0xFF1DE97C).withValues(alpha: opacity);
-      canvas.drawCircle(center, radius, paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _RipplePainter old) => old.phase != phase;
-}
-
-/// "MewSify" wordmark that reveals letter-by-letter. Each letter has
-/// its own 60 ms stagger and slides up + fades in.
-class _StaggeredWordmark extends StatelessWidget {
-  final double phase; // 0..1 across the whole word
-  const _StaggeredWordmark({required this.phase});
-
-  static const _text = 'MewSify';
-
-  @override
-  Widget build(BuildContext context) {
-    final chars = <Widget>[];
-    for (var i = 0; i < _text.length; i++) {
-      // Distribute each letter's window inside phase [0..1] with 60%
-      // overlap so the reveal feels continuous, not choppy.
-      final start = i / (_text.length + 2);
-      final end = (i + 2) / (_text.length + 2);
-      final t = ((phase - start) / (end - start)).clamp(0.0, 1.0);
-      final eased = Curves.easeOutCubic.transform(t);
-      chars.add(Opacity(
-        opacity: eased,
-        child: Transform.translate(
-          offset: Offset(0, (1 - eased) * 18),
-          child: Text(
-            _text[i],
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 40,
-              fontWeight: FontWeight.w900,
-              letterSpacing: -1.0,
-              height: 1.0,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          // Outer glow.
+          Container(
+            width: 132,
+            height: 132,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: const Color(0xFF1DE97C).withValues(alpha: 0.35),
+                  blurRadius: 44,
+                  spreadRadius: -6,
+                ),
+              ],
             ),
           ),
-        ),
-      ));
-    }
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: chars,
-    );
-  }
-}
-
-class _Sheen extends StatelessWidget {
-  final double t;
-  const _Sheen({required this.t});
-
-  @override
-  Widget build(BuildContext context) {
-    if (t <= 0 || t >= 1) return const SizedBox.shrink();
-    return Positioned.fill(
-      child: IgnorePointer(
-        child: FractionalTranslation(
-          translation: Offset(-1.0 + 2.0 * t, -0.4 + 0.8 * t),
-          child: Container(
-            width: 400,
-            height: 800,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  Colors.transparent,
-                  const Color(0x11FFFFFF).withValues(alpha: 0.09),
-                  Colors.transparent,
-                ],
+          // Rotating conic sheen — cheap GPU transform.
+          Transform.rotate(
+            angle: rotation,
+            child: Container(
+              width: 132,
+              height: 132,
+              decoration: const BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: SweepGradient(
+                  colors: [
+                    Color(0xFF0AA0AF),
+                    Color(0xFF1DE97C),
+                    Color(0xFF0AA0AF),
+                    Color(0xFF127C6A),
+                    Color(0xFF0AA0AF),
+                  ],
+                  stops: [0.0, 0.25, 0.5, 0.75, 1.0],
+                ),
               ),
             ),
           ),
-        ),
+          // Dark centre label.
+          Container(
+            width: 58,
+            height: 58,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: const Color(0xFF0B0E0D),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.08),
+                width: 1,
+              ),
+            ),
+          ),
+          // Centre spindle dot.
+          Container(
+            width: 10,
+            height: 10,
+            decoration: const BoxDecoration(
+              shape: BoxShape.circle,
+              color: Color(0xFF1DE97C),
+            ),
+          ),
+          // Play glyph fading in over the label.
+          Opacity(
+            opacity: glyphOpacity,
+            child: const Padding(
+              padding: EdgeInsets.only(left: 4),
+              child: Icon(Icons.play_arrow_rounded,
+                  color: Colors.white, size: 30),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A thin horizontal line with a bright accent segment sweeping across
+/// it — reads as a premium "loading" bar without a spinner.
+class _ProgressLine extends StatelessWidget {
+  final double t; // 0..1
+  const _ProgressLine({required this.t});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 150,
+      height: 2,
+      child: Stack(
+        children: [
+          Container(color: Colors.white.withValues(alpha: 0.08)),
+          Align(
+            alignment: Alignment(-1 + 2 * t, 0),
+            child: Container(
+              width: 46,
+              height: 2,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(colors: [
+                  Color(0x001DE97C),
+                  Color(0xFF1DE97C),
+                  Color(0x000AA0AF),
+                ]),
+                borderRadius: BorderRadius.circular(1),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -412,34 +308,16 @@ class _Credit extends StatelessWidget {
     return const Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Text(
-          'Created with ',
-          style: TextStyle(
-            color: Colors.white54,
-            fontSize: 12,
-            fontWeight: FontWeight.w400,
-            letterSpacing: 0.3,
-          ),
-        ),
-        Text('❤️', style: TextStyle(fontSize: 13)),
-        Text(
-          ' by ',
-          style: TextStyle(
-            color: Colors.white54,
-            fontSize: 12,
-            fontWeight: FontWeight.w400,
-            letterSpacing: 0.3,
-          ),
-        ),
-        Text(
-          'MOIN',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 13,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 2.4,
-          ),
-        ),
+        Text('Created with ',
+            style: TextStyle(color: Colors.white38, fontSize: 12)),
+        Text('❤️', style: TextStyle(fontSize: 12)),
+        Text(' by ', style: TextStyle(color: Colors.white38, fontSize: 12)),
+        Text('MOIN',
+            style: TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.5)),
       ],
     );
   }
