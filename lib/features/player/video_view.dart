@@ -78,7 +78,24 @@ class _VideoViewState extends ConsumerState<VideoView> {
   }
 
   Future<void> _load() async {
+    final handler = ref.read(audioHandlerProvider);
+    final audio = handler.rawPlayer;
+    // Snapshot audio state *before* we pause it so we can restore
+    // exactly what the user had (playing / paused, at what second).
+    final wasPlaying = audio.playing;
+    final targetPos = audio.position;
+
     try {
+      // Pausing audio during the video load window keeps the two
+      // timelines from drifting apart. Otherwise the audio would run
+      // during the ~1 s it takes to fetch the video URL + initialize
+      // the controller, and the video would spawn already-behind.
+      if (wasPlaying) {
+        try {
+          await audio.pause();
+        } catch (_) {}
+      }
+
       final source = ref.read(youtubeSourceProvider);
       final url = await source.resolveVideoOnlyUrl(widget.videoId);
       final controller = VideoPlayerController.networkUrl(
@@ -97,15 +114,41 @@ class _VideoViewState extends ConsumerState<VideoView> {
         return;
       }
       _controller = controller;
-      final handler = ref.read(audioHandlerProvider);
-      final audioPos = handler.rawPlayer.position;
-      if (audioPos > Duration.zero) {
-        await controller.seekTo(audioPos);
+
+      if (targetPos > Duration.zero) {
+        await controller.seekTo(targetPos);
       }
-      if (handler.rawPlayer.playing) {
-        await controller.play();
+
+      // Give the underlying player up to 1.2 s to finish buffering the
+      // first video segment at the sought position. Polling here means
+      // we launch playback the instant the frame is ready instead of
+      // hard-waiting a fixed delay.
+      final loadStart = DateTime.now();
+      while (mounted &&
+          controller.value.isBuffering &&
+          DateTime.now().difference(loadStart) <
+              const Duration(milliseconds: 1200)) {
+        await Future.delayed(const Duration(milliseconds: 50));
       }
+
+      if (!mounted) {
+        controller.dispose();
+        return;
+      }
+
       setState(() => _initializing = false);
+
+      // Now release both together — video first (already at the right
+      // frame + buffered), then audio a tick later so the frame is
+      // definitely on-screen when sound resumes.
+      if (wasPlaying) {
+        try {
+          await controller.play();
+        } catch (_) {}
+        try {
+          await audio.play();
+        } catch (_) {}
+      }
       _startSyncLoop();
     } catch (e) {
       if (mounted) {
@@ -114,23 +157,32 @@ class _VideoViewState extends ConsumerState<VideoView> {
           _error = e.toString();
         });
       }
+    } finally {
+      // Safety net: if anything went wrong along the way and we ended
+      // up with audio paused when the user actually wanted it playing,
+      // resume it. Losing music silently is the worst outcome here.
+      if (wasPlaying && !audio.playing) {
+        try {
+          await audio.play();
+        } catch (_) {}
+      }
     }
   }
 
   /// Runs while the widget is alive. Every 250 ms:
-  ///   * mirrors audio play/pause on the video
-  ///   * corrects video position when it's drifted > 300 ms, unless the
-  ///     video is currently buffering (in which case we let it catch up)
+  ///   * mirrors audio play/pause onto the video
+  ///   * corrects video position when it's drifted > 300 ms (and > 150
+  ///     ms during the first two seconds, where drift is most visible),
+  ///     unless the video is currently buffering (in which case we let
+  ///     it catch up on its own instead of stacking seeks).
   void _startSyncLoop() {
     _syncTimer?.cancel();
+    _syncStartedAt = DateTime.now();
     final handler = ref.read(audioHandlerProvider);
     _progressSub = handler.progressStream.listen((_) {});
     _syncTimer = Timer.periodic(const Duration(milliseconds: 250), (_) async {
       final controller = _controller;
       if (controller == null || !controller.value.isInitialized) return;
-      // Buffering means the video's already trying to catch up — leave
-      // it alone or we'll queue up seek calls faster than the network
-      // can service them.
       if (controller.value.isBuffering) return;
       final audio = handler.rawPlayer;
       if (audio.playing && !controller.value.isPlaying) {
@@ -145,7 +197,11 @@ class _VideoViewState extends ConsumerState<VideoView> {
       final videoMs = controller.value.position.inMilliseconds;
       final audioMs = audio.position.inMilliseconds;
       final drift = (videoMs - audioMs).abs();
-      if (drift > 300) {
+      final earlyPhase = _syncStartedAt != null &&
+          DateTime.now().difference(_syncStartedAt!) <
+              const Duration(seconds: 2);
+      final threshold = earlyPhase ? 150 : 300;
+      if (drift > threshold) {
         try {
           await controller.seekTo(audio.position);
         } catch (_) {}
@@ -153,6 +209,8 @@ class _VideoViewState extends ConsumerState<VideoView> {
       }
     });
   }
+
+  DateTime? _syncStartedAt;
 
   void _teardown() {
     _syncTimer?.cancel();

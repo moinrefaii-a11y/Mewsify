@@ -71,53 +71,61 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
   }
 
   Future<void> _applyAdSkipAndCleanup(InAppWebViewController c) async {
-    // CSS: hide the "install the YouTube app" and consent banners
-    // (both mobile web and pre-consent overlays).
+    // CSS: hide the "install the YouTube app" and consent banners plus
+    // any purely-cosmetic ad overlays. We do **not** hide the
+    // html5-video-player container itself — that's what plays real
+    // content.
     await c.injectCSSCode(source: r'''
       ytm-mealbar-promo-renderer, ytm-consent-bump-v2-lightbox,
-      ytm-privacy-tos-footer-renderer, ytm-ads-engagement-panel-content-renderer,
-      ytm-companion-ad-renderer, ytm-promoted-video-renderer,
-      ytm-promoted-sparkles-web-renderer, .ytp-ad-overlay-container,
-      .ytp-ad-image-overlay, .video-ads {
+      ytm-privacy-tos-footer-renderer, ytm-companion-ad-renderer,
+      ytm-promoted-video-renderer, ytm-promoted-sparkles-web-renderer,
+      .ytp-ad-overlay-container, .ytp-ad-image-overlay,
+      .video-ads > .ytp-ad-module {
         display: none !important;
       }
     ''');
-    // JS: aggressive ad handling. We combine three tactics:
-    //   1. Wide selector list of every skip-ad variant.
-    //   2. A MutationObserver so the moment YouTube inserts an ad DOM
-    //      node we react (instead of waiting for the next 200 ms tick).
-    //   3. During any ad state — even before the skip button appears —
-    //      we mute the video and crank playbackRate to 16× so the ad
-    //      is over in a fraction of a second.
+    // JS: conservative ad handling. Previous version was aggressive
+    // enough to break real playback (seek-to-end + 16x fired on false
+    // positives). This version only reacts when we're **highly**
+    // confident an ad is on screen:
+    //   * The player's own `.ad-showing` class is present on the
+    //     html5-video-player element, AND
+    //   * either the `.ytp-ad-player-overlay` or `.ytp-ad-preview-*`
+    //     nodes exist (indicates a real InStream ad state).
+    // In that case: click the skip button if it's up, and *only if
+    // ad is still showing* mute the audio. No playbackRate hacks — they
+    // can freeze the video element on Android WebView.
     await c.evaluateJavascript(source: r'''
       (function() {
         if (window.__mewsifyBrowseAdSkip) return;
         window.__mewsifyBrowseAdSkip = true;
 
         function isAdShowing() {
-          if (document.querySelector('.ad-showing')) return true;
-          if (document.querySelector('.ytp-ad-player-overlay')) return true;
-          if (document.querySelector('.ytp-ad-player-overlay-instream-info')) return true;
-          if (document.querySelector('.ad-container-single-media-element')) return true;
-          if (document.querySelector('.ytp-ad-preview-container')) return true;
-          if (document.querySelector('.ytp-ad-persistent-progress-bar-container')) return true;
-          if (document.querySelector('ytm-companion-slot')) return true;
-          return false;
+          var player = document.querySelector('.html5-video-player');
+          if (!player) return false;
+          // The player element is where YouTube attaches ".ad-showing".
+          if (!player.classList.contains('ad-showing') &&
+              !player.classList.contains('ad-interrupting')) {
+            return false;
+          }
+          // Double-confirm with an in-stream overlay so a stale class
+          // doesn't fool us into muting real content.
+          return !!document.querySelector(
+            '.ytp-ad-player-overlay, .ytp-ad-preview-container, ' +
+            '.ytp-ad-player-overlay-instream-info'
+          );
         }
 
         function tryClickSkip() {
-          var selectors = [
+          var sel = [
             '.ytp-ad-skip-button',
             '.ytp-ad-skip-button-modern',
             '.ytp-skip-ad-button',
-            '.ytp-ad-skip-button-container button',
             'button.ytp-ad-skip-button-modern',
-            'button[aria-label*="Skip"]',
-            'button[aria-label*="skip"]',
             '.videoAdUiSkipButton',
           ];
-          for (var i = 0; i < selectors.length; i++) {
-            var el = document.querySelector(selectors[i]);
+          for (var i = 0; i < sel.length; i++) {
+            var el = document.querySelector(sel[i]);
             if (el) { try { el.click(); return true; } catch(e) {} }
           }
           return false;
@@ -127,25 +135,31 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
           var v = document.querySelector('video');
           if (!v) return;
           if (isAdShowing()) {
-            if (!v.muted) v.muted = true;
-            try { if (v.playbackRate < 8) v.playbackRate = 16; } catch(e) {}
             tryClickSkip();
-            // Nuke the ad container hard: seek to the end of the ad.
-            try { if (v.duration && !isNaN(v.duration)) v.currentTime = v.duration; } catch(e) {}
+            // Mute so the ad doesn't blast the user; do not touch
+            // playbackRate (freezes video on mobile Chromium) and do
+            // not seek (would nuke real content on a false positive).
+            if (!v.muted) v.muted = true;
           } else {
-            if (v.muted) v.muted = false;
-            try { if (v.playbackRate !== 1) v.playbackRate = 1; } catch(e) {}
+            // Restore volume on ad end, but only if *we* muted it —
+            // don't override a user who tapped the mute button.
+            if (v.muted && !window.__mewsifyUserMuted) v.muted = false;
           }
         }
 
-        // Fast periodic tick catches state changes the observer misses.
-        setInterval(handleAd, 150);
+        setInterval(handleAd, 250);
 
-        // Immediate reactions to DOM insertions.
-        var obs = new MutationObserver(function() { handleAd(); });
-        try {
-          obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
-        } catch(e) {}
+        // React quickly to class changes on the player element itself
+        // (that's the one place we care about — much narrower than
+        // observing all of document.body was).
+        var player = document.querySelector('.html5-video-player');
+        if (player && window.MutationObserver) {
+          try {
+            new MutationObserver(handleAd).observe(player, {
+              attributes: true, attributeFilter: ['class']
+            });
+          } catch(e) {}
+        }
       })();
     ''');
   }

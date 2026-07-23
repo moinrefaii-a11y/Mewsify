@@ -233,40 +233,62 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
   // --- Crossfade --------------------------------------------------------
 
-  /// Watchdog: every 250 ms, check if we're inside the crossfade window
-  /// of the currently-playing track. 250 ms is fine-grained enough that
-  /// we won't miss the trigger window for short crossfades (e.g. 3 s).
-  /// Idle-cost is minimal: we only run when crossfadeSeconds > 0.
+  /// Watchdog running every 250 ms while a track is playing.
+  ///
+  /// Two jobs, both critical:
+  ///   1. **Crossfade trigger** — if crossfade is on and a next track
+  ///      exists, kick off the fade the moment we enter the window.
+  ///   2. **End-of-track fallback** — YouTube's timed URLs sometimes
+  ///      hang at the end of playback without emitting
+  ///      `ProcessingState.completed`. When we're within 300 ms of the
+  ///      duration and no completion event has fired, we manually
+  ///      trigger the same handler so autoplay never stalls.
   void _scheduleCrossfade() {
     _crossfadeWatchdog?.cancel();
-    final seconds = _crossfadeSeconds();
-    if (seconds <= 0) return;
-    debugPrint('[Crossfade] armed for ${seconds}s window');
-    _crossfadeWatchdog = Timer.periodic(const Duration(milliseconds: 250), (_) {
+    _crossfadeWatchdog =
+        Timer.periodic(const Duration(milliseconds: 250), (_) async {
       if (_crossfading) return;
       if (!_player.playing) return;
       final dur = _player.duration;
       final pos = _player.position;
-      if (dur == null || dur == Duration.zero) return;
+      if (dur == null || dur.inMilliseconds < 1000) return;
+
       final remaining = dur - pos;
-      // Trigger a hair before the ideal window so the fade starts
-      // before, not after, the natural end of the track.
-      if (remaining.inMilliseconds <= seconds * 1000 + 300 &&
-          remaining.inMilliseconds > 200) {
+      final rmMs = remaining.inMilliseconds;
+      final seconds = _crossfadeSeconds();
+
+      // 1) Crossfade path.
+      if (seconds > 0 && rmMs > 200 && rmMs <= seconds * 1000 + 300) {
         final next = _peekNextIndex();
-        if (next == null) return;
-        debugPrint('[Crossfade] triggering with ${remaining.inMilliseconds}ms left');
-        _startCrossfade(toIndex: next, durationSeconds: seconds);
+        if (next != null) {
+          debugPrint(
+              '[Watchdog] crossfade triggering with ${rmMs}ms remaining');
+          await _startCrossfade(toIndex: next, durationSeconds: seconds);
+          return;
+        }
+      }
+
+      // 2) Track-end fallback. Only fires when we're right at the end AND
+      // completionEnabled is still true (meaning the natural completion
+      // event never came).
+      if (rmMs <= 250 && rmMs > -3000 && _completionEnabled) {
+        _completionEnabled = false;
+        debugPrint(
+            '[Watchdog] forcing track end (no completion event fired)');
+        await _onTrackCompleted();
       }
     });
   }
 
   int _crossfadeSeconds() {
     if (!Hive.isBoxOpen('settings')) return 5;
-    // Default 5 s so the Apple-Music-style end-of-song mix fires out of
-    // the box; user can dial it down / off in Settings.
-    return (Hive.box('settings').get('crossfadeSeconds', defaultValue: 5) as int)
-        .clamp(0, 12);
+    final box = Hive.box('settings');
+    // If the user has never touched the Crossfade slider we default to
+    // 5 s. Using `containsKey` here — not just Hive's `defaultValue` —
+    // means users who upgraded from < v0.4 (where the stored default
+    // was `0`) get the new "on-by-default" behaviour instead of stale 0.
+    if (!box.containsKey('crossfadeSeconds')) return 5;
+    return (box.get('crossfadeSeconds') as int).clamp(0, 12);
   }
 
   int? _peekNextIndex() {
@@ -361,15 +383,29 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   }
 
   Future<void> _appendRelatedToQueue(String videoId) async {
+    List<Track> pool = const [];
     try {
-      final related = await _yt.related(videoId, limit: 10);
-      final filtered = related.where((t) => !_queue.contains(t)).toList();
-      if (filtered.isEmpty) return;
-      _queue.addAll(filtered);
-      queue.add(_queue.map((t) => t.toMediaItem()).toList());
-    } catch (_) {
-      // Ignore related fetch failures.
+      pool = await _yt.related(videoId, limit: 10);
+    } catch (e) {
+      debugPrint('[Autoplay] related() failed: $e');
     }
+    // If related failed or came back empty (happens sometimes when YT's
+    // PO token gate flips), fall back to a keyword search on the current
+    // track's artist so autoplay still gives the user something to play.
+    if (pool.isEmpty &&
+        _currentIndex >= 0 &&
+        _currentIndex < _queue.length) {
+      final current = _queue[_currentIndex];
+      try {
+        pool = await _yt.search(current.artist, limit: 10);
+      } catch (e) {
+        debugPrint('[Autoplay] fallback search failed: $e');
+      }
+    }
+    final filtered = pool.where((t) => !_queue.contains(t)).toList();
+    if (filtered.isEmpty) return;
+    _queue.addAll(filtered);
+    queue.add(_queue.map((t) => t.toMediaItem()).toList());
   }
 
   // --- Shuffle / repeat / sleep ----------------------------------------
