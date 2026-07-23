@@ -1,7 +1,7 @@
 name: melody
 description: A YouTube-powered music streamer with background playback, downloads, and offline support.
 publish_to: 'none'
-version: 0.7.1+17
+version: 0.8.0+19
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -23,6 +23,13 @@ dependencies:
   audio_service: ^0.18.15
   audio_session: ^0.1.21
   rxdart: ^0.27.7
+
+  # AutoMix analysis: extract an amplitude envelope from a track (via
+  # the platform's native decoder, so it handles YouTube's AAC/Opus)
+  # for on-device BPM detection. path_provider gives us a temp dir to
+  # stage the downloaded audio for analysis.
+  just_waveform: ^0.0.7
+  path_provider: ^2.1.4
 
   # YouTube extraction (InnerTube client, Dart port of youtube-dl)
   # Pinned to 3.x for the PO-token-aware extractor.

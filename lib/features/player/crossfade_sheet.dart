@@ -41,8 +41,11 @@ class _CrossfadeSheetState extends State<CrossfadeSheet> {
     _auto = _box.get('crossfadeAuto', defaultValue: false) as bool;
     _loudnessMatch =
         _box.get('crossfadeLoudnessMatch', defaultValue: true) as bool;
+    _beatMatch = _box.get('crossfadeBeatMatch', defaultValue: true) as bool;
     _debug = _box.get('crossfadeDebug', defaultValue: false) as bool;
   }
+
+  late bool _beatMatch;
 
   @override
   Widget build(BuildContext context) {
@@ -141,6 +144,24 @@ class _CrossfadeSheetState extends State<CrossfadeSheet> {
           ),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
+            title: const Text('Beat match (AutoMix)'),
+            subtitle: Text(
+              'Analyze each track\'s BPM and nudge the incoming song\'s '
+              'tempo to line the beats up during the fade — DJ-style. '
+              'Adds a short one-time analysis per track.',
+              style: TextStyle(
+                fontSize: 11,
+                color: scheme.onSurface.withValues(alpha: 0.65),
+              ),
+            ),
+            value: _beatMatch,
+            onChanged: (v) {
+              setState(() => _beatMatch = v);
+              _box.put('crossfadeBeatMatch', v);
+            },
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
             title: const Text('Show fade events (debug)'),
             subtitle: Text(
               'Snackbar messages when the fade preloads, fires, and '
@@ -165,8 +186,9 @@ class _CrossfadeSheetState extends State<CrossfadeSheet> {
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
-                  'BPM detection + beat-aligned mixing would need heavy '
-                  'audio analysis on the device. Not enabled for streaming.',
+                  'Beat match analyzes BPM on-device (one-time per track). '
+                  'Musical-key matching isn\'t available for streamed audio '
+                  'and is not applied.',
                   style: TextStyle(
                     fontSize: 11,
                     color: scheme.onSurface.withValues(alpha: 0.5),

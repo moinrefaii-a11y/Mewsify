@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:audio_service/audio_service.dart';
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'package:just_audio/just_audio.dart';
@@ -9,6 +10,7 @@ import 'package:rxdart/rxdart.dart';
 
 import '../data/models/track.dart';
 import '../data/sources/youtube_source.dart';
+import 'automix_analyzer.dart';
 
 /// Playback pipeline for MewSify.
 ///
@@ -48,11 +50,23 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   /// later behind a "try it and fall back gracefully" wrapper.
   final AudioPlayer _player = AudioPlayer();
 
-  /// Overlay player used only during crossfades. Lazy — most sessions
-  /// never crossfade, and an idle player still holds an audio-focus
-  /// session.
+  /// Overlay player used only during crossfades.
+  ///
+  /// `handleAudioSessionActivation: false` is THE critical flag for a
+  /// true-overlap crossfade. Without it, when the overlay calls
+  /// `play()` just_audio activates the Android audio session / requests
+  /// audio focus, which pauses or ducks the main player — so instead of
+  /// two tracks overlapping you'd hear only the incoming track from its
+  /// start (exactly the "plays next song from the beginning without
+  /// mixing" bug). With the flag off, the overlay rides the session the
+  /// main player already owns, and both play simultaneously.
   AudioPlayer? _crossfadeLazy;
-  AudioPlayer get _crossfadePlayer => _crossfadeLazy ??= AudioPlayer();
+  AudioPlayer get _crossfadePlayer => _crossfadeLazy ??= AudioPlayer(
+        // Don't touch audio focus / the session at all — the main
+        // player owns it, and the overlay just mixes on top.
+        handleAudioSessionActivation: false,
+        handleInterruptions: false,
+      );
 
   /// The backing playlist source for `_player`. We mutate it (`.add`,
   /// `.removeAt`) to grow / shrink the queue at runtime.
@@ -71,6 +85,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   List<int>? _shuffleOrder;
 
   final YouTubeSource _yt = YouTubeSource();
+  late final AutoMixAnalyzer _analyzer = AutoMixAnalyzer(_yt);
 
   // Reactive state surfaced to the UI.
   final BehaviorSubject<bool> shuffleMode = BehaviorSubject.seeded(false);
@@ -98,6 +113,31 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   bool _overlayPreloading = false;
 
   Future<void> _init() async {
+    // Configure the audio session for music playback. We keep the
+    // standard music focus for the main player, but the overlay
+    // player (created with handleAudioSessionActivation:false +
+    // handleInterruptions:false) rides this same session without
+    // requesting its own focus — that's what lets the two players
+    // mix simultaneously during a crossfade instead of one ducking
+    // the other.
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration(
+        avAudioSessionCategory: AVAudioSessionCategory.playback,
+        avAudioSessionMode: AVAudioSessionMode.defaultMode,
+        androidAudioAttributes: AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.music,
+          usage: AndroidAudioUsage.media,
+        ),
+        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+        androidWillPauseWhenDucked: false,
+      ));
+    } catch (e) {
+      debugPrint('[AudioSession] configure failed: $e');
+    }
+
+    await AutoMixAnalyzer.ensureBoxOpen();
+
     _bindPlayerListeners();
     _bindProgress();
     await _player.setAudioSource(
@@ -145,6 +185,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       _maybeAppendRelated();
       _persistQueue();
       _scheduleCrossfade();
+      _analyzeAroundCurrent();
     });
 
     _stateSub = _player.processingStateStream.listen((state) {
@@ -508,6 +549,26 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         .get('crossfadeLoudnessMatch', defaultValue: true) as bool;
   }
 
+  bool _beatMatchEnabled() {
+    if (!Hive.isBoxOpen('settings')) return true;
+    return Hive.box('settings')
+        .get('crossfadeBeatMatch', defaultValue: true) as bool;
+  }
+
+  /// Kick off background BPM analysis for the current + next couple of
+  /// tracks so the data is ready by the time a crossfade fires.
+  /// Analysis is cached in Hive, so this is a no-op after the first
+  /// time a track is seen.
+  void _analyzeAroundCurrent() {
+    if (!_beatMatchEnabled()) return;
+    for (var i = _currentIndex; i <= _currentIndex + 2 && i < _queue.length; i++) {
+      final vid = _queue[i].sourceVideoId;
+      if (_analyzer.cached(vid) == null) {
+        unawaited(_analyzer.analyze(vid));
+      }
+    }
+  }
+
 
 
   /// Runs a two-player crossfade between the current track (fading
@@ -557,15 +618,68 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         return;
       }
     }
+    // Stop the main player's ConcatenatingAudioSource from
+    // auto-advancing to the next track while we fade. If track A ends
+    // mid-fade, LoopMode.one makes it silently restart A (at volume 0,
+    // inaudible) instead of jumping to B and creating a THIRD stream.
+    // We restore the real loop mode during handoff.
+    LoopMode priorLoop = LoopMode.off;
+    try {
+      priorLoop = _player.loopMode;
+      await _player.setLoopMode(LoopMode.one);
+    } catch (_) {}
+
     try {
       await overlay.seek(Duration.zero);
       await overlay.setVolume(0.0);
       await overlay.play();
     } catch (e) {
       _crossfading = false;
+      try {
+        await _player.setLoopMode(priorLoop);
+      } catch (_) {}
       errorEvents.add('Overlay failed to start: $e');
       _scheduleCrossfade();
       return;
+    }
+
+    // Beat matching — nudge the INCOMING track's tempo so its BPM
+    // lines up with the outgoing track, the way a DJ rides the pitch
+    // fader. Only applied when:
+    //   * beat match is enabled,
+    //   * both tracks have a confident BPM reading, and
+    //   * the ratio is within ±8 % (beyond that, the pitch-shift
+    //     artefacts outweigh the benefit — better to just fade).
+    // Uses pitch-preserving time-stretch on Android via
+    // AudioPitchAlgorithm.linear.
+    double appliedSpeed = 1.0;
+    if (_beatMatchEnabled()) {
+      final outA = _analyzer.cached(_queue[_currentIndex].sourceVideoId);
+      final inA = _analyzer.cached(nextTrack.sourceVideoId);
+      if (outA != null &&
+          inA != null &&
+          outA.confident &&
+          inA.confident &&
+          outA.bpm > 0 &&
+          inA.bpm > 0) {
+        final ratio = outA.bpm / inA.bpm;
+        if (ratio >= 0.92 && ratio <= 1.08) {
+          appliedSpeed = ratio;
+          try {
+            // Pitch-preserving so the song doesn't chipmunk.
+            await overlay.setPitch(1.0);
+            await overlay.setSpeed(appliedSpeed);
+          } catch (e) {
+            debugPrint('[AutoMix] beat-match setSpeed failed: $e');
+            appliedSpeed = 1.0;
+          }
+          if (debug) {
+            errorEvents.add(
+                '🥁 Beat-match ${inA.bpm.toStringAsFixed(0)}→'
+                '${outA.bpm.toStringAsFixed(0)} BPM');
+          }
+        }
+      }
     }
 
     // Loudness match — cap incoming, pad outgoing so a jarring-loud
@@ -574,39 +688,58 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     final inPeak = match ? 0.92 : 1.0;
     final outPeak = match ? 1.05 : 1.0;
 
-    final steps = (durationSeconds * 20).clamp(20, 240);
-    final stepInterval =
-        Duration(milliseconds: durationSeconds * 1000 ~/ steps);
+    // 25 ms per step regardless of fade length — fine-grained enough to
+    // sound continuous, coarse enough that the per-step platform calls
+    // don't make the loop overrun the intended duration (which was
+    // pushing the fade past the outgoing track's natural end).
+    final steps = (durationSeconds * 1000 / 25).round().clamp(20, 480);
+    final stepInterval = durationSeconds * 1000 ~/ steps;
 
     for (var i = 1; i <= steps; i++) {
       final t = i / steps;
       // Equal-power volume curve — smoother than linear.
       final outVol = (cos(t * pi / 2) * outPeak).clamp(0.0, 1.0);
       final inVol = (sin(t * pi / 2) * inPeak).clamp(0.0, 1.0);
-      try {
-        await _player.setVolume(outVol);
-        await overlay.setVolume(inVol);
-      } catch (_) {}
-      await Future.delayed(stepInterval);
+      // Fire both volume changes without awaiting individually so the
+      // ramp keeps a steady wall-clock cadence (awaiting each platform
+      // call serially was stretching a 5 s fade to 7-8 s and letting
+      // the outgoing track hit its natural end mid-fade).
+      _player.setVolume(outVol).catchError((_) {});
+      overlay.setVolume(inVol).catchError((_) {});
+      await Future.delayed(Duration(milliseconds: stepInterval));
       if (!_crossfading) break;
     }
 
-    // Handoff — pause main *before* seeking so its concat never gets a
-    // chance to auto-advance on its own timeline. Seek main to
-    // overlay's live position on the next queue index, restore volume,
-    // resume main, pause overlay. The transition is inaudible because
-    // main was already at volume 0 and overlay was at target volume.
+    // Handoff. The overlay is the audible truth right now (full volume,
+    // playing track B at ~durationSeconds in). Promote main to B at the
+    // overlay's live position, restore its volume + loop mode, resume,
+    // then silence the overlay. Because main was already at volume 0
+    // and overlay was at full volume, the switch is inaudible.
     try {
+      // If we time-stretched the overlay for beat-matching, the main
+      // player will resume the incoming track at normal speed. To
+      // avoid an audible tempo jump at the handoff, scale the handoff
+      // position back by the applied speed (the overlay advanced
+      // faster/slower than real time) and reset main to speed 1.0.
+      final overlayPos = overlay.position;
+      final handoffPos = appliedSpeed == 1.0
+          ? overlayPos
+          : Duration(
+              milliseconds:
+                  (overlayPos.inMilliseconds / appliedSpeed).round());
       await _player.pause();
-      await _player.seek(overlay.position, index: toIndex);
+      await _player.setLoopMode(priorLoop);
+      await _player.setSpeed(1.0);
+      await _player.seek(handoffPos, index: toIndex);
       await _player.setVolume(1.0);
       await _player.play();
       await overlay.pause();
       await overlay.setVolume(0.0);
+      await overlay.setSpeed(1.0);
     } catch (e) {
       debugPrint('[AutoMix] handoff failed: $e');
-      // Best-effort recovery — force main to keep playing something.
       try {
+        await _player.setLoopMode(priorLoop);
         await _player.setVolume(1.0);
         await _player.play();
       } catch (_) {}
@@ -616,6 +749,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _currentIndex = toIndex;
     _overlayPreloadedFor = null; // ready to preload the next-next track
     mediaItem.add(nextTrack.toMediaItem());
+    if (debug) errorEvents.add('✅ Mix complete');
     _scheduleCrossfade();
     unawaited(_ensureUpcomingResolved());
     unawaited(_maybeAppendRelated());

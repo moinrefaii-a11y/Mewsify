@@ -212,6 +212,20 @@ class YouTubeSource {
     return c.url;
   }
 
+  /// Resolve the *lowest*-bitrate audio-only URL for a video. Used for
+  /// AutoMix analysis: we only need enough fidelity to detect the beat,
+  /// so downloading the smallest stream (typically ~50 kbps Opus) keeps
+  /// the analysis download fast and cheap.
+  Future<String> resolveLowBitrateAudioUrl(String videoId) async {
+    final manifest = await _resolveStreams(videoId);
+    final audios = manifest.audioOnly.toList()
+      ..sort((a, b) => a.bitrate.bitsPerSecond.compareTo(b.bitrate.bitsPerSecond));
+    if (audios.isEmpty) {
+      throw Exception('No audio-only stream for $videoId');
+    }
+    return audios.first.url.toString();
+  }
+
   /// Resolve video streams for the player. Returns one or more
   /// quality options the user can switch between.
   ///
