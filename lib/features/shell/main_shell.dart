@@ -60,18 +60,55 @@ class _MainShellState extends ConsumerState<MainShell>
   String? _lastHoistedId;
   double _hoistedFromSeconds = 0.0;
 
+  /// Track the videoId we've pre-warmed on the native audio pipeline
+  /// so we don't re-warm on every browser URL change or rebuild.
+  String? _warmedForVideoId;
+
+  /// Pre-warm the native audio pipeline for the /watch page the
+  /// browser is currently on. Runs while the app is still in the
+  /// foreground so all the async setup (URL resolution, setAudioSource,
+  /// MediaSession registration) is done under normal foreground rules.
+  /// When the user then backgrounds the app, `resumeWarmedHoist` is
+  /// synchronous and doesn't run afoul of Android 14's
+  /// foreground-service-from-background restrictions.
+  Future<void> _maybeWarmForBrowse(String? urlStr) async {
+    if (urlStr == null || urlStr.isEmpty) return;
+    Uri uri;
+    try {
+      uri = Uri.parse(urlStr);
+    } catch (_) {
+      return;
+    }
+    final id = _extractVideoId(uri);
+    if (id == null) return;
+    if (_warmedForVideoId == id) return;
+    // Never warm if the user has active native playback of a DIFFERENT
+    // track — we'd trample their session.
+    final currentTrack = ref.read(currentTrackProvider).valueOrNull;
+    if (currentTrack != null &&
+        currentTrack.sourceVideoId != id &&
+        ref.read(audioHandlerProvider).rawPlayer.playing) {
+      return;
+    }
+    _warmedForVideoId = id;
+    try {
+      final yt = ref.read(youtubeSourceProvider);
+      final track = await yt.getTrack(id);
+      await ref.read(audioHandlerProvider).prepareForBackgroundHoist(track);
+      await ref.read(libraryProvider).recordPlay(track);
+    } catch (e) {
+      debugPrint('[Shell] warm failed: $e');
+      _warmedForVideoId = null;
+    }
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (kIsWeb) return;
-    // App coming back to the foreground: hand audio back to the
-    // WebView if the user was actively watching in the Browse tab and
-    // we hoisted while they were away.
     if (state == AppLifecycleState.resumed) {
       _maybeReturnToBrowse();
       return;
     }
-    // Fire on `inactive` — a hair earlier than `paused` — so audio
-    // never gaps as the WebView loses its surface.
     if (state != AppLifecycleState.inactive &&
         state != AppLifecycleState.paused) {
       return;
@@ -90,37 +127,43 @@ class _MainShellState extends ConsumerState<MainShell>
     if (_lastHoistedId == id) return;
     _lastHoistedId = id;
     _hoistedFromSeconds = ref.read(browserVideoPositionProvider);
-    _hoistToNative(id, _hoistedFromSeconds);
+    _resumeHoist(id, _hoistedFromSeconds);
   }
 
-  Future<void> _hoistToNative(String videoId, double fromSeconds) async {
-    final currentTrack = ref.read(currentTrackProvider).valueOrNull;
-    if (currentTrack != null && currentTrack.sourceVideoId == videoId) return;
+  /// Fast path executed on app-going-background: assume the pipeline is
+  /// pre-warmed (see [_maybeWarmForBrowse]) and just flip to playing
+  /// at the correct position. Falls back to a full [playWithAutoplay]
+  /// only if the warm didn't happen (edge cases: user opens app for
+  /// the first time then immediately backgrounds).
+  Future<void> _resumeHoist(String videoId, double fromSeconds) async {
+    final handler = ref.read(audioHandlerProvider);
+    final startAt = Duration(milliseconds: (fromSeconds * 1000).round());
     try {
-      final yt = ref.read(youtubeSourceProvider);
-      yt.prewarmAudioUrl(videoId);
-      final track = await yt.getTrack(videoId);
-      final handler = ref.read(audioHandlerProvider);
-      await handler.playWithAutoplay(track);
-      // Seek to the WebView video's last known second so background
-      // audio picks up exactly where the video paused.
-      if (fromSeconds > 1.0) {
-        await handler.seek(Duration(milliseconds: (fromSeconds * 1000).round()));
+      if (_warmedForVideoId == videoId) {
+        // Fast path: just play the pre-warmed source.
+        await handler.resumeWarmedHoist(startAt: startAt);
+      } else {
+        // Slow path: user backgrounded before we finished warming.
+        final yt = ref.read(youtubeSourceProvider);
+        final track = await yt.getTrack(videoId);
+        await handler.playWithAutoplay(track);
+        if (startAt > Duration.zero) await handler.seek(startAt);
+        await ref.read(libraryProvider).recordPlay(track);
       }
-      await ref.read(libraryProvider).recordPlay(track);
       if (mounted) {
+        final title = handler.currentTrack?.title ?? 'this video';
         ScaffoldMessenger.of(context)
           ..hideCurrentSnackBar()
           ..showSnackBar(
             SnackBar(
-              content: Text('Playing "${track.title}" in background'),
+              content: Text('Playing "$title" in background'),
               duration: const Duration(seconds: 3),
               behavior: SnackBarBehavior.floating,
             ),
           );
       }
     } catch (e) {
-      debugPrint('[BackgroundHoist] failed: $e');
+      debugPrint('[Hoist] resume failed: $e');
     }
   }
 
@@ -245,6 +288,15 @@ class _MainShellState extends ConsumerState<MainShell>
         ..showSnackBar(
           SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
         );
+    });
+
+    // Pre-warm the native audio pipeline whenever the Browser tab
+    // lands on a new /watch page. This means backgrounding the app
+    // triggers a synchronous `play()` instead of a slow async
+    // resolve → set-source → play chain that Android 14+ can block
+    // from a paused-app state.
+    ref.listen<String?>(browserCurrentUrlProvider, (_, next) {
+      _maybeWarmForBrowse(next);
     });
 
     // Hide the mini player on the Browse tab so it doesn't sit on top

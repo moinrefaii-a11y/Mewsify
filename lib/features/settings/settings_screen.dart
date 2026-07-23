@@ -258,8 +258,12 @@ class _CrossfadeTileState extends State<_CrossfadeTile> {
   @override
   void initState() {
     super.initState();
-    _seconds = (Hive.box('settings').get('crossfadeSeconds', defaultValue: 0) as int)
-        .clamp(0, 12);
+    final box = Hive.box('settings');
+    // Match the audio-handler default: 5 s if the user has never
+    // touched the slider (the box has no entry yet).
+    _seconds = box.containsKey('crossfadeSeconds')
+        ? (box.get('crossfadeSeconds') as int).clamp(0, 12)
+        : 5;
   }
 
   @override

@@ -10,6 +10,7 @@ import '../../services/audio_handler.dart';
 import '../../services/palette_service.dart';
 import '../../services/pip_service.dart';
 import '../../widgets/track_artwork.dart';
+import 'crossfade_sheet.dart';
 import 'queue_sheet.dart';
 import 'sleep_timer_sheet.dart';
 import 'video_view.dart';
@@ -556,7 +557,14 @@ class _ExtrasRow extends ConsumerWidget {
             builder: (_) => const SleepTimerSheet(),
           ),
         ),
-
+        // Crossfade — quick access from the player itself. Previously
+        // this was buried in Profile → App settings, hence the "where
+        // is it?" confusion.
+        _ExtraButton(
+          icon: Icons.multitrack_audio,
+          label: 'Crossfade',
+          onTap: () => CrossfadeSheet.show(context),
+        ),
         _ExtraButton(
           icon: Icons.queue_music_outlined,
           label: 'Queue',

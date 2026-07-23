@@ -209,6 +209,75 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     await _persistQueue();
   }
 
+  /// Pre-warm the native audio pipeline for a specific video without
+  /// actually playing it. Used by the Browse tab: as soon as the user
+  /// lands on a /watch page we load the audio source into the player
+  /// muted + paused. If the user then backgrounds the app, we can
+  /// resume with just `play()` — no async URL resolution racing the
+  /// OS's foreground-service-from-background restrictions.
+  ///
+  /// Called at most once per videoId; subsequent calls short-circuit
+  /// if the same track is already warmed.
+  String? _warmedVideoId;
+  Future<void> prepareForBackgroundHoist(Track track) async {
+    if (_warmedVideoId == track.sourceVideoId) return;
+    _warmedVideoId = track.sourceVideoId;
+    try {
+      final url = await _yt.resolveAudioUrl(track.sourceVideoId);
+      // We only warm on the primary player if it's *not* currently
+      // playing something else — never interrupt an existing session.
+      if (_player.playing) {
+        debugPrint('[Hoist] skipping warm — primary is already playing');
+        return;
+      }
+      _queue
+        ..clear()
+        ..add(track);
+      _currentIndex = 0;
+      queue.add(_queue.map((t) => t.toMediaItem()).toList());
+      mediaItem.add(track.toMediaItem());
+      await _player.setAudioSource(
+        AudioSource.uri(Uri.parse(url)),
+        preload: true,
+      );
+      await _player.setVolume(0);
+      // Explicitly paused; we'll flip to playing when the app goes
+      // background.
+      debugPrint('[Hoist] warmed native pipeline for ${track.title}');
+    } catch (e) {
+      debugPrint('[Hoist] warm failed: $e');
+      _warmedVideoId = null;
+    }
+  }
+
+  /// Flip the pre-warmed audio into audible playback. Synchronous fast
+  /// path used on `AppLifecycleState.inactive` when the user
+  /// backgrounds the app with the Browser tab still on a /watch page.
+  Future<void> resumeWarmedHoist({
+    required Duration startAt,
+  }) async {
+    if (_warmedVideoId == null) return;
+    try {
+      if (startAt > Duration.zero) {
+        await _player.seek(startAt);
+      }
+      await _player.setVolume(1.0);
+      await _player.play();
+      _scheduleCrossfade();
+      // Kick related-tracks fetch off in the background so autoplay
+      // has a queue to move into.
+      unawaited(_appendRelatedToQueue(_warmedVideoId!));
+      debugPrint('[Hoist] resumed warmed hoist at ${startAt.inSeconds}s');
+    } catch (e) {
+      debugPrint('[Hoist] resume failed: $e');
+    }
+  }
+
+  /// Reset the warmed marker so a different video can be warmed next.
+  void clearWarmedHoist() {
+    _warmedVideoId = null;
+  }
+
   Future<void> playWithAutoplay(Track seed) async {
     _queue
       ..clear()
@@ -280,9 +349,54 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _crossfadeWatchdog =
         Timer.periodic(const Duration(milliseconds: 250), (_) async {
       if (_crossfading) return;
-      if (!_player.playing) return;
-      final dur = _effectiveDuration();
+      if (!_player.playing) {
+        // Reset stall bookkeeping when we're intentionally paused so
+        // resuming after a long pause doesn't immediately count as a
+        // stall.
+        _stallTicks = 0;
+        _lastKnownPosMs = _player.position.inMilliseconds;
+        return;
+      }
+
       final pos = _player.position;
+
+      // ---- 1) Stall detection (duration-independent) ----------------
+      // MUST run before any duration-dependent early-return. YouTube
+      // Music tracks often don't publish a stream duration, which
+      // previously blocked the watchdog from ever reaching the stall
+      // check. Result: audio would freeze silently mid-song, UI still
+      // showed "playing", and nothing would auto-advance.
+      if (_lastKnownPosMs == pos.inMilliseconds) {
+        _stallTicks++;
+        // 3 s of no forward progress while the player claims to be
+        // playing = stalled. Skip aggressively so the user isn't
+        // staring at a silent "playing" state.
+        if (_stallTicks >= 12 && !_advancing) {
+          _advancing = true;
+          _stallTicks = 0;
+          debugPrint('[Watchdog] stall detected at ${pos.inSeconds}s — skipping');
+          errorEvents.add('Playback stalled — skipping');
+          try {
+            // Pause first so the UI reflects the transition instead of
+            // continuing to show a "playing" state during the resolve
+            // for the next track.
+            await _player.pause();
+          } catch (_) {}
+          try {
+            await skipToNext();
+          } catch (_) {}
+          Future.delayed(const Duration(seconds: 1), () {
+            _advancing = false;
+          });
+          return;
+        }
+      } else {
+        _lastKnownPosMs = pos.inMilliseconds;
+        _stallTicks = 0;
+      }
+
+      // ---- 2) Duration-dependent checks below -----------------------
+      final dur = _effectiveDuration();
       if (dur == null || dur.inMilliseconds < 1000) return;
 
       final remaining = dur - pos;
@@ -306,7 +420,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         });
       }
 
-      // 1) Crossfade path.
+      // 3) Crossfade window.
       if (seconds > 0 && rmMs > 200 && rmMs <= seconds * 1000 + 300) {
         final next = _peekNextIndex();
         if (next != null) {
@@ -317,16 +431,13 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         }
       }
 
-      // 2) Track-end fallback. Fires whenever we're within 300 ms of
-      // the natural end of the track and we're not already mid-fade or
-      // mid-advance. Ignores `_completionEnabled` — a stuck-false flag
-      // was the exact bug that left users stranded at the end of a
-      // track when just_audio silently ate the `completed` event.
+      // 4) Track-end fallback. Ignores `_completionEnabled` because a
+      // stuck-false flag was the exact bug that stranded users at end
+      // of track when just_audio ate the `completed` event.
       if (rmMs <= 300 && rmMs > -3000 && !_advancing) {
         _advancing = true;
         _completionEnabled = false;
-        debugPrint(
-            '[Watchdog] forcing track end at ${rmMs}ms remaining');
+        debugPrint('[Watchdog] forcing track end at ${rmMs}ms remaining');
         try {
           await _onTrackCompleted();
         } finally {
@@ -334,38 +445,19 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
             _advancing = false;
           });
         }
-        return;
-      }
-
-      // 3) Position-stall fallback. If the player claims to be playing
-      // but the position hasn't advanced in 5 s, treat as stuck and
-      // advance. YouTube throttles some streams so aggressively that
-      // playback hangs mid-song without an error event.
-      if (_lastKnownPosMs == pos.inMilliseconds) {
-        _stallTicks++;
-        if (_stallTicks >= 20 && !_advancing) {
-          // 20 * 250 ms = 5 s of no forward progress while playing.
-          _advancing = true;
-          _stallTicks = 0;
-          debugPrint('[Watchdog] position stall detected — skipping');
-          errorEvents.add('Playback stalled — skipping');
-          try {
-            await skipToNext();
-          } finally {
-            Future.delayed(const Duration(seconds: 1), () {
-              _advancing = false;
-            });
-          }
-        }
-      } else {
-        _lastKnownPosMs = pos.inMilliseconds;
-        _stallTicks = 0;
       }
     });
   }
 
   int _lastKnownPosMs = 0;
   int _stallTicks = 0;
+
+  /// True while the player claims to be playing but position hasn't
+  /// advanced in > 750 ms — a real-time signal that the stream is
+  /// stalled / buffering. Consumed by the mini-player and Now Playing
+  /// UI to swap the "playing" animation for a spinner so the user
+  /// isn't lied to during a network hiccup.
+  bool get isStalled => _stallTicks >= 3 && _player.playing;
 
   bool _advancing = false;
   bool _refillInFlight = false;
@@ -405,11 +497,34 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     if (!Hive.isBoxOpen('settings')) return 5;
     final box = Hive.box('settings');
     // If the user has never touched the Crossfade slider we default to
-    // 5 s. Using `containsKey` here — not just Hive's `defaultValue` —
-    // means users who upgraded from < v0.4 (where the stored default
-    // was `0`) get the new "on-by-default" behaviour instead of stale 0.
-    if (!box.containsKey('crossfadeSeconds')) return 5;
-    return (box.get('crossfadeSeconds') as int).clamp(0, 12);
+    // 5 s. `containsKey` (not Hive's `defaultValue`) makes upgraders
+    // from < v0.4 fall through to the new default too.
+    final base = box.containsKey('crossfadeSeconds')
+        ? (box.get('crossfadeSeconds') as int).clamp(0, 12)
+        : 5;
+    if (base == 0) return 0;
+
+    // Auto-duration mode: shorten the fade for short tracks so we
+    // don't blend across, say, a 60 s snippet's chorus. Longer tracks
+    // get the full user-configured length.
+    final auto = box.get('crossfadeAuto', defaultValue: false) as bool;
+    if (auto &&
+        _currentIndex >= 0 &&
+        _currentIndex < _queue.length) {
+      final dur = _queue[_currentIndex].duration;
+      if (dur.inSeconds > 0) {
+        if (dur.inSeconds < 90) return 2;
+        if (dur.inSeconds < 150) return 3;
+        if (dur.inSeconds < 240) return (base * 0.7).round().clamp(2, base);
+      }
+    }
+    return base;
+  }
+
+  bool _loudnessMatchEnabled() {
+    if (!Hive.isBoxOpen('settings')) return true;
+    return Hive.box('settings')
+        .get('crossfadeLoudnessMatch', defaultValue: true) as bool;
   }
 
   int? _peekNextIndex() {
@@ -452,19 +567,34 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       return;
     }
 
+    // Peak volumes for each side of the fade. When "Match loudness" is
+    // on we cap the incoming track at 0.92 and pad the outgoing side
+    // to 1.08 (via a soft ramp) so a jarring-loud next track doesn't
+    // slam over a mellow current one. It's a coarse approximation of
+    // real replay-gain / LUFS matching but works well enough that the
+    // seams don't feel like a "volume click".
+    final match = _loudnessMatchEnabled();
+    final inPeak = match ? 0.92 : 1.0;
+    final outPeak = match ? 1.05 : 1.0;
+
     final steps = (durationSeconds * 20).clamp(20, 240); // 20 fps
     final stepInterval = Duration(milliseconds: durationSeconds * 1000 ~/ steps);
 
     for (var i = 1; i <= steps; i++) {
       final t = i / steps;
       // Equal-power crossfade curve sounds smoother than a linear ramp.
-      final outVol = (cos(t * pi / 2)).clamp(0.0, 1.0);
-      final inVol = (sin(t * pi / 2)).clamp(0.0, 1.0);
+      final outVol = (cos(t * pi / 2) * outPeak).clamp(0.0, 1.0);
+      final inVol = (sin(t * pi / 2) * inPeak).clamp(0.0, 1.0);
       await fadeOut.setVolume(outVol);
       await fadeIn.setVolume(inVol);
       await Future.delayed(stepInterval);
       if (!_crossfading) break; // user skipped or stopped
     }
+    // After the fade, restore incoming to full volume so subsequent
+    // playback isn't ceiling-limited.
+    try {
+      await fadeIn.setVolume(1.0);
+    } catch (_) {}
 
     // Promote the fade-in player to "primary".
     await fadeOut.pause();

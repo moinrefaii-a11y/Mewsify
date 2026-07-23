@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -243,9 +244,25 @@ class _MiniPlayPauseButtonState extends ConsumerState<_MiniPlayPauseButton>
     vsync: this,
     duration: const Duration(milliseconds: 200),
   );
+  Timer? _stallProbe;
+  bool _stalled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Poll handler.isStalled every 500 ms so the icon reflects a
+    // stalled stream (silent but "playing") without the audio handler
+    // having to broadcast yet another stream.
+    _stallProbe = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (!mounted) return;
+      final v = ref.read(audioHandlerProvider).isStalled;
+      if (v != _stalled) setState(() => _stalled = v);
+    });
+  }
 
   @override
   void dispose() {
+    _stallProbe?.cancel();
     _animCtrl.dispose();
     super.dispose();
   }
@@ -259,6 +276,19 @@ class _MiniPlayPauseButtonState extends ConsumerState<_MiniPlayPauseButton>
       _animCtrl.forward();
     } else {
       _animCtrl.reverse();
+    }
+
+    // If the stream is stalled, show a spinner instead of the
+    // play/pause icon so the UI doesn't lie about audible playback.
+    if (_stalled) {
+      return const IconButton(
+        icon: SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        onPressed: null,
+      );
     }
 
     return IconButton(

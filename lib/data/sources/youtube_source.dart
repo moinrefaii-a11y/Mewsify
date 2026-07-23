@@ -203,6 +203,15 @@ class YouTubeSource {
     unawaited(resolveAudioUrl(videoId).catchError((_) => ''));
   }
 
+  /// Read a cached audio URL without kicking off a resolution.
+  /// Returns null if there is no fresh cache entry.
+  String? cachedAudioUrl(String videoId) {
+    final c = _audioUrlCache[videoId];
+    if (c == null) return null;
+    if (DateTime.now().isAfter(c.expiresAt)) return null;
+    return c.url;
+  }
+
   /// Resolve video streams for the player. Returns one or more
   /// quality options the user can switch between.
   ///
