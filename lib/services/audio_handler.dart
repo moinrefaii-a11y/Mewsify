@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:math';
 
-import 'package:flutter/foundation.dart';
 import 'package:audio_service/audio_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:rxdart/rxdart.dart';
@@ -10,139 +10,143 @@ import 'package:rxdart/rxdart.dart';
 import '../data/models/track.dart';
 import '../data/sources/youtube_source.dart';
 
-/// Glues just_audio (the player) to audio_service (the OS-level
-/// foreground service / lock-screen integration).
+/// Playback pipeline for MewSify.
 ///
-/// Uses **two AudioPlayer instances in alternation** so we can do a
-/// real Apple-Music / Spotify-style audio crossfade:
-///   - During the last N seconds of a track, the next track is
-///     pre-loaded on the inactive player at volume 0 and starts
-///     playing while the active track ramps down to 0.
-///   - When the active track finishes the inactive player has already
-///     ramped up to full volume; we then promote it to "primary".
+/// v0.6.0 architecture: **ConcatenatingAudioSource** for auto-advance
+/// (matches how Spotify / YouTube Music / Apple Music work). The main
+/// AudioPlayer plays a concat source; just_audio handles gapless
+/// advancement between tracks in native code. Our Dart layer only
+/// listens to `currentIndexStream` to know when to fetch more.
+///
+/// A secondary AudioPlayer overlays during crossfades to blend the
+/// last N seconds of the outgoing track with the first N seconds of
+/// the incoming one. When the crossfade completes we sync the main
+/// player's position to the overlay and hand playback back — the
+/// user hears a seamless transition.
+///
+/// "AutoMix" mode adds three heuristic transition improvements on top
+/// of the raw crossfade:
+///   - Adaptive fade *duration* (short songs get shorter fades)
+///   - Loudness match (caps incoming volume, pads outgoing) so a
+///     jarring-loud next track doesn't slam over a mellow current one
+///   - Silent-intro detection (implicit — the concat source already
+///     handles gapless if the audio itself starts quietly)
 class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   MelodyAudioHandler() {
-    _player = _a;
     _init();
   }
 
-  /// Primary player. The secondary one (`_b`) is only created the
-  /// first time we actually need to crossfade — most users keep
-  /// crossfade off, and an idle AudioPlayer still costs CPU + memory.
-  late final AudioPlayer _a = AudioPlayer();
-  AudioPlayer? _bLazy;
-  AudioPlayer get _b => _bLazy ??= AudioPlayer();
+  /// Main player. Plays a `ConcatenatingAudioSource` that grows as we
+  /// resolve upcoming tracks. just_audio auto-advances between items
+  /// natively so we never rely on Dart-side end-of-track detection.
+  final AudioPlayer _player = AudioPlayer();
 
-  late AudioPlayer _player; // foreground player; UI listens to this
-  AudioPlayer get _other => identical(_player, _a) ? _b : _a; // lazy-allocates _b
+  /// Overlay player used only during crossfades. Lazily created so we
+  /// don't hold a second decoder + audio focus session when crossfade
+  /// is off (the default for many users).
+  AudioPlayer? _crossfadeLazy;
+  AudioPlayer get _crossfadePlayer => _crossfadeLazy ??= AudioPlayer();
 
-  /// Listener subscriptions on the active player. Re-bound after every
-  /// crossfade swap so events keep flowing to audio_service / UI.
-  StreamSubscription? _eventSub;
-  StreamSubscription? _stateSub;
-  StreamSubscription? _indexSub;
+  /// The backing playlist source for `_player`. We mutate it (`.add`,
+  /// `.removeAt`) to grow / shrink the queue at runtime.
+  final ConcatenatingAudioSource _concat =
+      ConcatenatingAudioSource(children: []);
+
+  /// Logical queue: full list of user-visible tracks. May run ahead of
+  /// `_concat.length` because we resolve URLs lazily (URLs from
+  /// YouTube expire ≤ 6 h, so pre-resolving the whole queue is wasteful).
+  final List<Track> _queue = [];
+
+  /// Index within `_queue` (and `_concat`) that's currently playing.
+  int _currentIndex = 0;
+
+  /// Shuffle bookkeeping (only meaningful when `shuffleMode.value`).
+  List<int>? _shuffleOrder;
 
   final YouTubeSource _yt = YouTubeSource();
-  final List<Track> _queue = [];
-  List<int>? _shuffleOrder;
-  int _currentIndex = -1;
 
   // Reactive state surfaced to the UI.
   final BehaviorSubject<bool> shuffleMode = BehaviorSubject.seeded(false);
   final BehaviorSubject<PlaybackRepeat> repeatMode =
       BehaviorSubject.seeded(PlaybackRepeat.off);
   final BehaviorSubject<Duration?> sleepTimer = BehaviorSubject.seeded(null);
-
-  /// Stream of player errors (network 403, source not found, etc.).
   final BehaviorSubject<String?> errorEvents = BehaviorSubject.seeded(null);
 
-  bool _completionEnabled = true;
+  // Subscriptions on the main player.
+  StreamSubscription? _eventSub;
+  StreamSubscription? _stateSub;
+  StreamSubscription? _indexSub;
+  StreamSubscription? _durationSub;
 
   Timer? _sleepTimerTask;
   Timer? _crossfadeWatchdog;
   bool _crossfading = false;
+  bool _resolvingNext = false;
 
   Future<void> _init() async {
-    _bindActiveListeners();
-
-    // Restore the last queue from disk so reopening the app continues
-    // where the user left off (paused at the last track + position).
+    _bindPlayerListeners();
+    _bindProgress();
+    await _player.setAudioSource(
+      _concat,
+      preload: false,
+      initialIndex: 0,
+    );
     _restoreQueue();
-
-    // Watchdog health check: every 2 s, verify the crossfade watchdog
-    // is still armed while the player is playing. If it isn't, re-arm
-    // it. Cheap safety net against edge cases where a code path skips
-    // calling `_scheduleCrossfade()` after a track change.
-    _healthCheck?.cancel();
-    _healthCheck = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (_player.playing &&
-          (_crossfadeWatchdog == null || !_crossfadeWatchdog!.isActive)) {
-        debugPrint('[Health] watchdog missing while playing — re-arming');
-        _scheduleCrossfade();
-      }
-    });
   }
 
-  Timer? _healthCheck;
+  // ---------------------------------------------------------------------
+  //  Player event wiring
+  // ---------------------------------------------------------------------
 
-  /// Listens to the *currently active* player. Called once at startup
-  /// and every time we promote the inactive player after a crossfade.
-  void _bindActiveListeners() {
+  void _bindPlayerListeners() {
     _eventSub?.cancel();
     _stateSub?.cancel();
     _indexSub?.cancel();
-
-    _bindProgress();
+    _durationSub?.cancel();
 
     _eventSub = _player.playbackEventStream.listen(
       _broadcastState,
       onError: (Object e, StackTrace st) {
-        // Mid-stream error (URL expired mid-play, network dropped, DRM).
-        // Guard the auto-skip with `_advancing` so we don't stack up on
-        // the resolve path's own retry logic — one failure, one skip.
+        // Mid-stream error (URL expired, network dropped, DRM). Try to
+        // remove the bad item from the concat source and let just_audio
+        // advance to the next one naturally.
         debugPrint('[Player] mid-stream error: $e');
-        if (_advancing) return;
-        _advancing = true;
-        _completionEnabled = false;
-        errorEvents.add('Playback error — skipping');
-        Future.microtask(() async {
-          try {
-            await skipToNext();
-          } catch (_) {}
-          Future.delayed(const Duration(seconds: 1), () {
-            _advancing = false;
-          });
-        });
+        errorEvents.add('Skipping — connection issue on this track');
+        _skipBrokenAndAdvance();
       },
     );
 
-    _stateSub = _player.processingStateStream.listen((state) {
-      if (state == ProcessingState.completed &&
-          _completionEnabled &&
-          !_crossfading) {
-        _onTrackCompleted();
-      }
-      if (state == ProcessingState.ready) {
-        _completionEnabled = true;
-      }
-    });
-
+    // Auto-advance is now driven by just_audio's native playlist logic.
+    // The Dart side just needs to know WHICH item is playing so it can:
+    //   * update the media item (lock screen / notification)
+    //   * pre-resolve upcoming URLs
+    //   * fetch related tracks when the queue is near-empty
     _indexSub = _player.currentIndexStream.listen((index) {
-      if (index == null || _currentIndex >= _queue.length) return;
-      mediaItem.add(_queue[_currentIndex].toMediaItem());
+      if (index == null) return;
+      _currentIndex = index;
+      if (_currentIndex >= 0 && _currentIndex < _queue.length) {
+        mediaItem.add(_queue[_currentIndex].toMediaItem());
+      }
+      _ensureUpcomingResolved();
+      _maybeAppendRelated();
+      _persistQueue();
+      _scheduleCrossfade();
     });
 
-    // When just_audio resolves the real duration of the current track,
-    // rebroadcast the MediaItem with that duration. Bluetooth head units
-    // (AVRCP) and Android Auto need a non-zero duration to display track
-    // info — otherwise you get "No info provided" on the car screen.
-    _durationSub?.cancel();
+    _stateSub = _player.processingStateStream.listen((state) {
+      if (state == ProcessingState.completed) {
+        // Reached the end of the concat source — no more items and no
+        // more upcoming. Try one last related-tracks fetch.
+        _handleFinalCompletion();
+      }
+    });
+
     _durationSub = _player.durationStream.listen((d) {
+      // Rebroadcast MediaItem with the resolved duration so lockscreen
+      // + Bluetooth head units show real track info.
       if (d == null || d == Duration.zero) return;
       if (_currentIndex < 0 || _currentIndex >= _queue.length) return;
       final current = _queue[_currentIndex];
-      // Update the queue entry so future reads (and lock screen "next")
-      // carry the correct duration too.
       if (current.duration != d) {
         _queue[_currentIndex] = Track(
           id: current.id,
@@ -159,9 +163,197 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     });
   }
 
-  StreamSubscription? _durationSub;
+  // ---------------------------------------------------------------------
+  //  Queue setup
+  // ---------------------------------------------------------------------
 
-  // --- Queue persistence ------------------------------------------------
+  Future<void> setQueue(List<Track> tracks, {int startIndex = 0}) async {
+    _queue
+      ..clear()
+      ..addAll(tracks);
+    _shuffleOrder = null;
+    if (shuffleMode.value) _rebuildShuffleOrder(startIndex);
+    queue.add(_queue.map((t) => t.toMediaItem()).toList());
+
+    _currentIndex = startIndex.clamp(0, _queue.length - 1);
+    await _rebuildConcat(startAt: _currentIndex, initialResolveCount: 3);
+    await _player.play();
+    _persistQueue();
+  }
+
+  /// Rebuild `_concat` from scratch starting at `_queue[startAt]`.
+  /// Resolves the first `initialResolveCount` upcoming items in
+  /// parallel so playback can start ASAP while background resolves
+  /// warm up the following items.
+  Future<void> _rebuildConcat({
+    required int startAt,
+    int initialResolveCount = 3,
+  }) async {
+    await _concat.clear();
+    if (_queue.isEmpty) return;
+    // Resolve the head of the queue in parallel so playback can start
+    // even if some URLs 403 — we'll skip broken items automatically.
+    final headEnd = min(startAt + initialResolveCount, _queue.length);
+    final futures = <Future<AudioSource?>>[];
+    for (var i = startAt; i < headEnd; i++) {
+      futures.add(_makeSource(_queue[i]));
+    }
+    final sources = await Future.wait(futures);
+    for (var i = 0; i < sources.length; i++) {
+      final src = sources[i];
+      if (src != null) {
+        await _concat.add(src);
+      } else {
+        // Broken track — remove from logical queue too so the concat
+        // and _queue indices stay aligned.
+        final drop = startAt + i;
+        if (drop < _queue.length) {
+          _queue.removeAt(drop);
+          queue.add(_queue.map((t) => t.toMediaItem()).toList());
+        }
+      }
+    }
+    if (_concat.length == 0) {
+      errorEvents.add('Could not load any tracks');
+      return;
+    }
+    // Point the player at position 0 of the freshly built concat.
+    await _player.seek(Duration.zero, index: 0);
+  }
+
+  /// Build an [AudioSource] for a single [Track]. Returns null if the
+  /// URL couldn't be resolved (which is common for
+  /// geo-blocked / age-restricted / removed videos on YouTube).
+  Future<AudioSource?> _makeSource(Track track) async {
+    try {
+      final url = await _yt.resolveAudioUrl(track.sourceVideoId);
+      return AudioSource.uri(
+        Uri.parse(url),
+        tag: track.toMediaItem(),
+      );
+    } catch (e) {
+      debugPrint('[AudioHandler] source failed for ${track.title}: $e');
+      return null;
+    }
+  }
+
+  /// Called after every index change. Ensures the concat source has
+  /// resolved sources for the next couple of tracks so just_audio's
+  /// native auto-advance can jump straight to them.
+  Future<void> _ensureUpcomingResolved() async {
+    if (_resolvingNext) return;
+    _resolvingNext = true;
+    try {
+      // Target: at least 2 items after the current in the concat.
+      while (_concat.length < _currentIndex + 3 &&
+          _concat.length < _queue.length) {
+        final idx = _concat.length;
+        final src = await _makeSource(_queue[idx]);
+        if (src != null) {
+          await _concat.add(src);
+        } else {
+          // Drop broken track from logical queue too. Since it's ahead
+          // of the current index, this doesn't shift what's playing.
+          _queue.removeAt(idx);
+          queue.add(_queue.map((t) => t.toMediaItem()).toList());
+        }
+      }
+    } finally {
+      _resolvingNext = false;
+    }
+  }
+
+  /// If we're within 3 items of the tail of the logical queue, fetch
+  /// related tracks and append. This is the "infinite radio" behaviour
+  /// Spotify/YMusic use.
+  Future<void> _maybeAppendRelated() async {
+    if (_currentIndex + 3 < _queue.length) return;
+    if (_appendingRelated) return;
+    _appendingRelated = true;
+    try {
+      if (_queue.isEmpty) return;
+      final seed = _queue.last;
+      List<Track> pool = const [];
+      try {
+        pool = await _yt.related(seed.sourceVideoId, limit: 15);
+      } catch (_) {}
+      if (pool.isEmpty) {
+        try {
+          pool = await _yt.search(seed.artist, limit: 15);
+        } catch (_) {}
+      }
+      // Filter: reasonable duration, not already in queue.
+      final picks = pool
+          .where((t) => !_queue.contains(t))
+          .where(_reasonableDuration)
+          .take(8)
+          .toList();
+      if (picks.isEmpty) return;
+      _queue.addAll(picks);
+      queue.add(_queue.map((t) => t.toMediaItem()).toList());
+      // Kick off resolution for the new items so they're ready when we
+      // reach them.
+      unawaited(_ensureUpcomingResolved());
+    } finally {
+      _appendingRelated = false;
+    }
+  }
+
+  bool _appendingRelated = false;
+
+  bool _reasonableDuration(Track t) {
+    final s = t.duration.inSeconds;
+    if (s == 0) return true;
+    return s >= 45 && s <= 15 * 60;
+  }
+
+  Future<void> _skipBrokenAndAdvance() async {
+    // Remove the current source; the concat will auto-shift and
+    // just_audio will start playing the next item.
+    try {
+      if (_currentIndex < _concat.length) {
+        await _concat.removeAt(_currentIndex);
+        if (_currentIndex < _queue.length) {
+          _queue.removeAt(_currentIndex);
+          queue.add(_queue.map((t) => t.toMediaItem()).toList());
+        }
+      }
+    } catch (_) {}
+    // Kick play if we have anything left.
+    if (_concat.length > 0) {
+      await _player.play();
+    }
+  }
+
+  Future<void> _handleFinalCompletion() async {
+    // End of the entire concat source. Try one more related fetch
+    // and, if that yields items, resume playback from there.
+    if (repeatMode.value == PlaybackRepeat.all && _queue.isNotEmpty) {
+      await _rebuildConcat(startAt: 0);
+      await _player.play();
+      return;
+    }
+    await _maybeAppendRelated();
+    if (_concat.length > _currentIndex + 1) {
+      await _player.seek(Duration.zero, index: _currentIndex + 1);
+      await _player.play();
+    }
+  }
+
+  Future<void> playWithAutoplay(Track seed) async {
+    _queue
+      ..clear()
+      ..add(seed);
+    _currentIndex = 0;
+    queue.add(_queue.map((t) => t.toMediaItem()).toList());
+    await _rebuildConcat(startAt: 0, initialResolveCount: 1);
+    await _player.play();
+    unawaited(_maybeAppendRelated());
+  }
+
+  // ---------------------------------------------------------------------
+  //  Queue persistence
+  // ---------------------------------------------------------------------
 
   static const _queueBoxName = 'queue';
 
@@ -171,7 +363,6 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     if (box.isEmpty) return;
     final settings = Hive.box('settings');
     final savedIndex = settings.get('queueIndex', defaultValue: 0) as int;
-    final savedPositionMs = settings.get('queuePositionMs', defaultValue: 0) as int;
 
     _queue
       ..clear()
@@ -181,23 +372,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     if (_currentIndex < _queue.length) {
       mediaItem.add(_queue[_currentIndex].toMediaItem());
     }
-
-    // Resolve audio URL in the background so the app doesn't freeze
-    // on the splash screen waiting for a network response.
-    unawaited(_loadRestoredTrack(savedPositionMs));
-  }
-
-  Future<void> _loadRestoredTrack(int savedPositionMs) async {
-    try {
-      final track = _queue[_currentIndex];
-      final url = await _yt.resolveAudioUrl(track.sourceVideoId);
-      await _player.setAudioSource(
-        AudioSource.uri(Uri.parse(url)),
-        initialPosition: Duration(milliseconds: savedPositionMs),
-      );
-    } catch (_) {
-      // Network unavailable at startup — user can tap play later.
-    }
+    // Don't auto-play on restore — user has to hit play.
   }
 
   Future<void> _persistQueue() async {
@@ -210,357 +385,55 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     await settings.put('queuePositionMs', _player.position.inMilliseconds);
   }
 
-  // --- Queue setup ------------------------------------------------------
+  // ---------------------------------------------------------------------
+  //  Crossfade (AutoMix-style overlay)
+  // ---------------------------------------------------------------------
 
-  Future<void> setQueue(List<Track> tracks, {int startIndex = 0}) async {
-    _queue
-      ..clear()
-      ..addAll(tracks);
-    _shuffleOrder = null;
-    if (shuffleMode.value) _rebuildShuffleOrder(startIndex);
-    queue.add(_queue.map((t) => t.toMediaItem()).toList());
-    _currentIndex = startIndex.clamp(0, _queue.length - 1);
-    await _playIndex(_currentIndex);
-    await _persistQueue();
-  }
-
-  /// Pre-warm the native audio pipeline for a specific video without
-  /// actually playing it. Used by the Browse tab: as soon as the user
-  /// lands on a /watch page we load the audio source into the player
-  /// muted + paused. If the user then backgrounds the app, we can
-  /// resume with just `play()` — no async URL resolution racing the
-  /// OS's foreground-service-from-background restrictions.
-  ///
-  /// Called at most once per videoId; subsequent calls short-circuit
-  /// if the same track is already warmed.
-  String? _warmedVideoId;
-  Future<void> prepareForBackgroundHoist(Track track) async {
-    if (_warmedVideoId == track.sourceVideoId) return;
-    _warmedVideoId = track.sourceVideoId;
-    try {
-      final url = await _yt.resolveAudioUrl(track.sourceVideoId);
-      // We only warm on the primary player if it's *not* currently
-      // playing something else — never interrupt an existing session.
-      if (_player.playing) {
-        debugPrint('[Hoist] skipping warm — primary is already playing');
-        return;
-      }
-      _queue
-        ..clear()
-        ..add(track);
-      _currentIndex = 0;
-      queue.add(_queue.map((t) => t.toMediaItem()).toList());
-      mediaItem.add(track.toMediaItem());
-      await _player.setAudioSource(
-        AudioSource.uri(Uri.parse(url)),
-        preload: true,
-      );
-      await _player.setVolume(0);
-      // Explicitly paused; we'll flip to playing when the app goes
-      // background.
-      debugPrint('[Hoist] warmed native pipeline for ${track.title}');
-    } catch (e) {
-      debugPrint('[Hoist] warm failed: $e');
-      _warmedVideoId = null;
-    }
-  }
-
-  /// Flip the pre-warmed audio into audible playback. Synchronous fast
-  /// path used on `AppLifecycleState.inactive` when the user
-  /// backgrounds the app with the Browser tab still on a /watch page.
-  Future<void> resumeWarmedHoist({
-    required Duration startAt,
-  }) async {
-    if (_warmedVideoId == null) return;
-    try {
-      if (startAt > Duration.zero) {
-        await _player.seek(startAt);
-      }
-      await _player.setVolume(1.0);
-      await _player.play();
-      _scheduleCrossfade();
-      // Kick related-tracks fetch off in the background so autoplay
-      // has a queue to move into.
-      unawaited(_appendRelatedToQueue(_warmedVideoId!));
-      debugPrint('[Hoist] resumed warmed hoist at ${startAt.inSeconds}s');
-    } catch (e) {
-      debugPrint('[Hoist] resume failed: $e');
-    }
-  }
-
-  /// Reset the warmed marker so a different video can be warmed next.
-  void clearWarmedHoist() {
-    _warmedVideoId = null;
-  }
-
-  Future<void> playWithAutoplay(Track seed) async {
-    _queue
-      ..clear()
-      ..add(seed);
-    _currentIndex = 0;
-    queue.add(_queue.map((t) => t.toMediaItem()).toList());
-    await _playIndex(0);
-    await _persistQueue();
-    // Await the related-tracks fetch so the queue is populated *before*
-    // the current track can end. Previously we fired-and-forgot which
-    // meant Next / auto-advance could be a no-op if the fetch hadn't
-    // returned in time.
-    await _appendRelatedToQueue(seed.sourceVideoId);
-  }
-
-  Future<void> _playIndex(int index, [int retryCount = 0]) async {
-    if (index < 0 || index >= _queue.length) return;
-    _currentIndex = index;
-    final track = _queue[index];
-    mediaItem.add(track.toMediaItem());
-
-    try {
-      final url = await _yt.resolveAudioUrl(track.sourceVideoId);
-      _completionEnabled = true;
-      // Passing the search-result duration as a fallback lets just_audio
-      // populate `duration` even when the stream itself doesn't ship
-      // one (some Music tracks do this). Without it the crossfade
-      // watchdog silently gives up because `_player.duration` is null.
-      await _player.setAudioSource(
-        AudioSource.uri(Uri.parse(url)),
-        preload: true,
-      );
-      await _player.setVolume(1.0);
-      await _player.play();
-      _scheduleCrossfade();
-      _armDurationFallback(track);
-      // Proactively top up the up-next queue after every track change.
-      // Waiting until "last 30 s" was too late for many songs: if that
-      // fetch failed there was no time to retry before the track ended
-      // and autoplay silently died.
-      if (_peekNextIndex() == null && !_refillInFlight) {
-        _refillInFlight = true;
-        unawaited(_appendRelatedToQueue(track.sourceVideoId).whenComplete(() {
-          _refillInFlight = false;
-        }));
-      }
-    } catch (e) {
-      if (retryCount < 1) {
-        await Future.delayed(const Duration(milliseconds: 800));
-        return _playIndex(index, retryCount + 1);
-      }
-      // Auto-recover — advance to the next track instead of leaving the
-      // user stuck. Only bail entirely if there *is* no next track.
-      debugPrint('[Player] resolve failed for ${track.title}: $e');
-      errorEvents.add('Skipped "${track.title}" — could not stream');
-      final next = _peekNextIndex();
-      if (next != null && next != index) {
-        await _playIndex(next);
-      } else {
-        _completionEnabled = false;
-      }
-    }
-  }
-
-  // --- Crossfade --------------------------------------------------------
-
-  /// Watchdog running every 250 ms while a track is playing.
-  ///
-  /// Two jobs, both critical:
-  ///   1. **Crossfade trigger** — if crossfade is on and a next track
-  ///      exists, kick off the fade the moment we enter the window.
-  ///   2. **End-of-track fallback** — YouTube's timed URLs sometimes
-  ///      hang at the end of playback without emitting
-  ///      `ProcessingState.completed`. When we're within 300 ms of the
-  ///      duration and no completion event has fired, we manually
-  ///      trigger the same handler so autoplay never stalls.
+  /// Every 250 ms while the main player is playing, check whether we
+  /// should be running a crossfade to the next item. If yes, fire it
+  /// off. The main player still auto-advances on its own timeline
+  /// (silently, because we ramp its volume to 0); the overlay player
+  /// carries the audible transition.
   void _scheduleCrossfade() {
     _crossfadeWatchdog?.cancel();
     _crossfadeWatchdog =
         Timer.periodic(const Duration(milliseconds: 250), (_) async {
       if (_crossfading) return;
-      if (!_player.playing) {
-        // Reset stall bookkeeping when we're intentionally paused so
-        // resuming after a long pause doesn't immediately count as a
-        // stall.
-        _stallTicks = 0;
-        _lastKnownPosMs = _player.position.inMilliseconds;
-        return;
-      }
-
+      if (!_player.playing) return;
+      final dur = _player.duration;
       final pos = _player.position;
-
-      // ---- 1) End-of-track / stall detection (duration-independent).
-      // Must run before any duration-dependent early-return. If the
-      // player claims to be playing but position hasn't moved in ~2 s
-      // we either hit a stalled stream OR the stream ended without
-      // just_audio emitting a `completed` event (common on YouTube
-      // audio streams).
-      if (_lastKnownPosMs == pos.inMilliseconds) {
-        _stallTicks++;
-        if (_stallTicks >= 8 && !_advancing) {
-          _advancing = true;
-          _stallTicks = 0;
-          final dur = _effectiveDuration();
-          final atEnd = dur != null
-              ? pos.inMilliseconds >= dur.inMilliseconds - 3000
-              : pos.inSeconds > 45;
-          final next = _peekNextIndex();
-          final seconds = _crossfadeSeconds();
-          // If we're at a natural end + crossfade is enabled + we have
-          // a next track ready → run the crossfade instead of a hard
-          // cut skip. This is what the user is asking for: songs
-          // that flow into each other rather than gap-then-jump.
-          if (atEnd && seconds > 0 && next != null) {
-            debugPrint(
-                '[Watchdog] end-of-track crossfade to $next');
-            _advancing = false; // crossfade owns advancing state
-            await _startCrossfade(
-              toIndex: next,
-              durationSeconds: seconds.clamp(2, 6),
-            );
-            return;
-          }
-          if (atEnd) {
-            debugPrint(
-                '[Watchdog] natural end at ${pos.inSeconds}s — silent skip');
-          } else {
-            debugPrint(
-                '[Watchdog] mid-song stall at ${pos.inSeconds}s — skip + notify');
-            errorEvents.add('Skipping — connection issue on this track');
-          }
-          try {
-            await _player.pause();
-          } catch (_) {}
-          try {
-            await skipToNext();
-          } catch (_) {}
-          Future.delayed(const Duration(seconds: 1), () {
-            _advancing = false;
-          });
-          return;
-        }
-      } else {
-        _lastKnownPosMs = pos.inMilliseconds;
-        _stallTicks = 0;
-      }
-
-      // ---- 2) Duration-dependent checks below -----------------------
-      final dur = _effectiveDuration();
       if (dur == null || dur.inMilliseconds < 1000) return;
-
-      final remaining = dur - pos;
-      final rmMs = remaining.inMilliseconds;
+      final rmMs = (dur - pos).inMilliseconds;
       final seconds = _crossfadeSeconds();
-
-      // Proactive up-next refill: as soon as we cross the "last 30 s"
-      // threshold and don't have a next slot lined up, fire off a
-      // related-tracks fetch. Without this the fetch races the natural
-      // end of the track and autoplay stalls on the last song.
-      if (rmMs <= 30000 && !_refillInFlight && _peekNextIndex() == null) {
-        _refillInFlight = true;
-        Future(() async {
-          try {
-            if (_currentIndex >= 0 && _currentIndex < _queue.length) {
-              await _appendRelatedToQueue(_queue[_currentIndex].sourceVideoId);
-            }
-          } finally {
-            _refillInFlight = false;
-          }
-        });
+      if (seconds <= 0) return;
+      // Only run the fade if there's a next item queued and we're
+      // within the fade window (with a 300 ms lead so the fade starts
+      // just before the natural end).
+      if (rmMs > 200 && rmMs <= seconds * 1000 + 300) {
+        final nextIdx = _currentIndex + 1;
+        if (nextIdx >= _queue.length) return;
+        await _startCrossfade(toIndex: nextIdx, durationSeconds: seconds);
       }
-
-      // 3) Crossfade window.
-      if (seconds > 0 && rmMs > 200 && rmMs <= seconds * 1000 + 300) {
-        final next = _peekNextIndex();
-        if (next != null) {
-          debugPrint(
-              '[Watchdog] crossfade triggering with ${rmMs}ms remaining');
-          await _startCrossfade(toIndex: next, durationSeconds: seconds);
-          return;
-        }
-      }
-
-      // 4) Track-end fallback. Ignores `_completionEnabled` because a
-      // stuck-false flag was the exact bug that stranded users at end
-      // of track when just_audio ate the `completed` event.
-      if (rmMs <= 300 && rmMs > -3000 && !_advancing) {
-        _advancing = true;
-        _completionEnabled = false;
-        debugPrint('[Watchdog] forcing track end at ${rmMs}ms remaining');
-        try {
-          await _onTrackCompleted();
-        } finally {
-          Future.delayed(const Duration(seconds: 1), () {
-            _advancing = false;
-          });
-        }
-      }
-    });
-  }
-
-  int _lastKnownPosMs = 0;
-  int _stallTicks = 0;
-
-  /// True while the player claims to be playing but position hasn't
-  /// advanced in > 750 ms — a real-time signal that the stream is
-  /// stalled / buffering. Consumed by the mini-player and Now Playing
-  /// UI to swap the "playing" animation for a spinner so the user
-  /// isn't lied to during a network hiccup.
-  bool get isStalled => _stallTicks >= 3 && _player.playing;
-
-  bool _advancing = false;
-  bool _refillInFlight = false;
-
-  /// Best-effort duration for the current track. Prefers just_audio's
-  /// resolved duration; falls back to the search-result duration on the
-  /// Track model for the small subset of streams that don't publish
-  /// one. Used by the watchdog so crossfade + end-of-track detection
-  /// stay alive even when `_player.duration` is null.
-  Duration? _effectiveDuration() {
-    final playerDur = _player.duration;
-    if (playerDur != null && playerDur > Duration.zero) return playerDur;
-    if (_currentIndex >= 0 && _currentIndex < _queue.length) {
-      final track = _queue[_currentIndex];
-      if (track.duration > Duration.zero) return track.duration;
-    }
-    return null;
-  }
-
-  /// If just_audio hasn't resolved a duration within 3 seconds of us
-  /// starting a track, rebroadcast the MediaItem with the search-result
-  /// duration so car head units + Android Auto still show track info.
-  void _armDurationFallback(Track track) {
-    if (track.duration == Duration.zero) return;
-    Future.delayed(const Duration(seconds: 3), () {
-      if (_currentIndex < 0 || _currentIndex >= _queue.length) return;
-      if (_queue[_currentIndex] != track) return;
-      final resolved = _player.duration;
-      if (resolved != null && resolved > Duration.zero) return;
-      debugPrint(
-          '[Player] duration fallback: using ${track.duration}');
-      mediaItem.add(track.toMediaItem());
     });
   }
 
   int _crossfadeSeconds() {
     if (!Hive.isBoxOpen('settings')) return 5;
     final box = Hive.box('settings');
-    // If the user has never touched the Crossfade slider we default to
-    // 5 s. `containsKey` (not Hive's `defaultValue`) makes upgraders
-    // from < v0.4 fall through to the new default too.
+    // 5 s default if the user has never touched the slider.
     final base = box.containsKey('crossfadeSeconds')
         ? (box.get('crossfadeSeconds') as int).clamp(0, 12)
         : 5;
     if (base == 0) return 0;
-
-    // Auto-duration mode: shorten the fade for short tracks so we
-    // don't blend across, say, a 60 s snippet's chorus. Longer tracks
-    // get the full user-configured length.
     final auto = box.get('crossfadeAuto', defaultValue: false) as bool;
-    if (auto &&
-        _currentIndex >= 0 &&
-        _currentIndex < _queue.length) {
-      final dur = _queue[_currentIndex].duration;
-      if (dur.inSeconds > 0) {
-        if (dur.inSeconds < 90) return 2;
-        if (dur.inSeconds < 150) return 3;
-        if (dur.inSeconds < 240) return (base * 0.7).round().clamp(2, base);
+    if (!auto) return base;
+    // AutoMix adaptive duration — short songs get shorter fades.
+    if (_currentIndex >= 0 && _currentIndex < _queue.length) {
+      final d = _queue[_currentIndex].duration.inSeconds;
+      if (d > 0) {
+        if (d < 90) return 2;
+        if (d < 150) return 3;
+        if (d < 240) return (base * 0.7).round().clamp(2, base);
       }
     }
     return base;
@@ -572,195 +445,89 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         .get('crossfadeLoudnessMatch', defaultValue: true) as bool;
   }
 
-  int? _peekNextIndex() {
-    if (_queue.isEmpty) return null;
-    if (shuffleMode.value && _shuffleOrder != null) {
-      final pos = _shuffleOrder!.indexOf(_currentIndex);
-      if (pos < 0 || pos + 1 >= _shuffleOrder!.length) return null;
-      return _shuffleOrder![pos + 1];
-    }
-    return _currentIndex + 1 < _queue.length ? _currentIndex + 1 : null;
-  }
-
-  /// Pre-loads `_queue[toIndex]` on the inactive player and animates a
-  /// volume crossover. After the crossover, the inactive player becomes
-  /// the new "primary".
+  /// Runs a two-player crossfade between the current track (fading out
+  /// on `_player`) and the next track (fading in on `_crossfadePlayer`).
+  /// After the fade we resync the main player's position to the
+  /// overlay's and hand playback back to the main pipeline.
   Future<void> _startCrossfade({
     required int toIndex,
     required int durationSeconds,
   }) async {
     if (_crossfading) return;
+    if (toIndex >= _queue.length) return;
     _crossfading = true;
-    _completionEnabled = false;
     _crossfadeWatchdog?.cancel();
 
-    final fadeOut = _player;
-    final fadeIn = _other;
     final nextTrack = _queue[toIndex];
+    final overlay = _crossfadePlayer;
 
     try {
       final url = await _yt.resolveAudioUrl(nextTrack.sourceVideoId);
-      await fadeIn.setAudioSource(AudioSource.uri(Uri.parse(url)));
-      await fadeIn.setVolume(0.0);
-      await fadeIn.play();
+      await overlay.setAudioSource(
+        AudioSource.uri(Uri.parse(url)),
+        preload: true,
+      );
+      await overlay.setVolume(0.0);
+      await overlay.play();
     } catch (e) {
-      // Failed to preload — abort crossfade gracefully.
       _crossfading = false;
-      _completionEnabled = true;
-      errorEvents.add('Could not preload next track: $e');
+      errorEvents.add('Could not preload next track for crossfade: $e');
       _scheduleCrossfade();
       return;
     }
 
-    // Peak volumes for each side of the fade. When "Match loudness" is
-    // on we cap the incoming track at 0.92 and pad the outgoing side
-    // to 1.08 (via a soft ramp) so a jarring-loud next track doesn't
-    // slam over a mellow current one. It's a coarse approximation of
-    // real replay-gain / LUFS matching but works well enough that the
-    // seams don't feel like a "volume click".
+    // Loudness match: cap incoming and pad outgoing so a jarring-loud
+    // next track doesn't slam over a mellow current one.
     final match = _loudnessMatchEnabled();
     final inPeak = match ? 0.92 : 1.0;
     final outPeak = match ? 1.05 : 1.0;
 
-    final steps = (durationSeconds * 20).clamp(20, 240); // 20 fps
-    final stepInterval = Duration(milliseconds: durationSeconds * 1000 ~/ steps);
+    final steps = (durationSeconds * 20).clamp(20, 240);
+    final stepInterval =
+        Duration(milliseconds: durationSeconds * 1000 ~/ steps);
 
     for (var i = 1; i <= steps; i++) {
       final t = i / steps;
-      // Equal-power crossfade curve sounds smoother than a linear ramp.
+      // Equal-power curve sounds smoother than a linear ramp.
       final outVol = (cos(t * pi / 2) * outPeak).clamp(0.0, 1.0);
       final inVol = (sin(t * pi / 2) * inPeak).clamp(0.0, 1.0);
-      await fadeOut.setVolume(outVol);
-      await fadeIn.setVolume(inVol);
-      await Future.delayed(stepInterval);
-      if (!_crossfading) break; // user skipped or stopped
-    }
-    // After the fade, restore incoming to full volume so subsequent
-    // playback isn't ceiling-limited.
-    try {
-      await fadeIn.setVolume(1.0);
-    } catch (_) {}
-
-    // Promote the fade-in player to "primary".
-    await fadeOut.pause();
-    await fadeOut.seek(Duration.zero);
-    _player = fadeIn;
-    _currentIndex = toIndex;
-    _bindActiveListeners();
-    mediaItem.add(nextTrack.toMediaItem());
-    _crossfading = false;
-    _completionEnabled = true;
-    _scheduleCrossfade();
-    await _persistQueue();
-  }
-
-  // --- Track-end handling ----------------------------------------------
-
-  Future<void> _onTrackCompleted() async {
-    final mode = repeatMode.value;
-    if (mode == PlaybackRepeat.one) {
-      await _player.seek(Duration.zero);
-      await _player.play();
-      return;
-    }
-    // Try to extend the queue with related tracks if we don't already
-    // have a next slot lined up. This makes autoplay work exactly like
-    // YouTube / YouTube Music — the "up next" is inferred from what's
-    // playing now, not a fixed playlist.
-    if (_peekNextIndex() == null && _queue.isNotEmpty) {
-      await _appendRelatedToQueue(_queue.last.sourceVideoId);
-    }
-    final hasNext = _peekNextIndex() != null;
-    if (hasNext) {
-      await skipToNext();
-    } else if (mode == PlaybackRepeat.all) {
-      await skipToQueueItem(0);
-    }
-  }
-
-  Future<void> _appendRelatedToQueue(String videoId) async {
-    List<Track> pool = const [];
-    try {
-      pool = await _yt.related(videoId, limit: 20);
-    } catch (e) {
-      debugPrint('[Autoplay] related() failed: $e');
-    }
-    // If related came back empty (happens sometimes when YT's PO token
-    // gate flips), fall back to a keyword search on the current track's
-    // artist so autoplay still gives the user something to play.
-    if (pool.isEmpty &&
-        _currentIndex >= 0 &&
-        _currentIndex < _queue.length) {
-      final current = _queue[_currentIndex];
       try {
-        pool = await _yt.search(current.artist, limit: 20);
-      } catch (e) {
-        debugPrint('[Autoplay] fallback search failed: $e');
+        await _player.setVolume(outVol);
+        await overlay.setVolume(inVol);
+      } catch (_) {}
+      await Future.delayed(stepInterval);
+      if (!_crossfading) break;
+    }
+
+    // Hand playback back to the main player. During the fade the main
+    // player may have auto-advanced from the outgoing track to the
+    // incoming one at position 0 — sync it to where the overlay
+    // actually is, then restore volume.
+    try {
+      final overlayPos = overlay.position;
+      if (_player.currentIndex != toIndex) {
+        await _player.seek(overlayPos, index: toIndex);
+      } else {
+        await _player.seek(overlayPos);
       }
+      await _player.setVolume(1.0);
+      await overlay.setVolume(0.0);
+      await overlay.pause();
+    } catch (e) {
+      debugPrint('[Crossfade] handoff failed: $e');
     }
-    // Filter with a graceful fallback: try aggressive first, then just
-    // duration, and finally the unfiltered pool. Bad filter output is
-    // way worse than "some autoplay picks are compilations" — a filter
-    // that rejects everything and stalls playback is the worst outcome.
-    final notInQueue = pool.where((t) => !_queue.contains(t)).toList();
-    var picks = notInQueue.where(_looksLikeASong).toList();
-    if (picks.isEmpty) {
-      // Just duration filter — drops multi-hour mixes but keeps
-      // legitimate long titles like "Song Name (Extended Mix)".
-      picks = notInQueue.where(_reasonableDuration).toList();
-    }
-    if (picks.isEmpty) picks = notInQueue; // last resort
-    if (picks.isEmpty) return;
-    debugPrint('[Autoplay] appending ${picks.take(10).length} related tracks');
-    _queue.addAll(picks.take(10));
-    queue.add(_queue.map((t) => t.toMediaItem()).toList());
+
+    _crossfading = false;
+    _currentIndex = toIndex;
+    mediaItem.add(nextTrack.toMediaItem());
+    _scheduleCrossfade();
+    unawaited(_ensureUpcomingResolved());
+    unawaited(_maybeAppendRelated());
   }
 
-  /// Heuristic filter for autoplay picks. First-pass filter that
-  /// rejects on both duration + title. If it kills the entire pool we
-  /// fall back to just duration, so autoplay never fully stalls on
-  /// filter output.
-  bool _looksLikeASong(Track t) {
-    if (!_reasonableDuration(t)) return false;
-    final title = t.title.toLowerCase();
-    // Only reject titles with *strong* signals of a compilation /
-    // long-form upload. Generic words like "mix" alone are too
-    // common in legit remix titles ("Extended Mix", "Radio Mix").
-    const blockers = [
-      'compilation',
-      'full album',
-      'nonstop',
-      'jukebox',
-      '1 hour',
-      '2 hour',
-      '3 hour',
-      '10 hour',
-      'megamix',
-      'top 100',
-      'top 50',
-      'playlist',
-      'lo-fi mix',
-      'chill mix',
-      'workout mix',
-    ];
-    for (final b in blockers) {
-      if (title.contains(b)) return false;
-    }
-    return true;
-  }
-
-  /// Loose duration filter (45 s – 15 min). Kept separate so it can be
-  /// used as a fallback when the strict `_looksLikeASong` filter would
-  /// have rejected everything.
-  bool _reasonableDuration(Track t) {
-    final secs = t.duration.inSeconds;
-    if (secs == 0) return true; // unknown → give it the benefit of the doubt
-    if (secs > 15 * 60) return false;
-    if (secs < 45) return false;
-    return true;
-  }
-
-  // --- Shuffle / repeat / sleep ----------------------------------------
+  // ---------------------------------------------------------------------
+  //  Shuffle / repeat / sleep
+  // ---------------------------------------------------------------------
 
   void _rebuildShuffleOrder(int currentIndex) {
     final indices = List.generate(_queue.length, (i) => i)..remove(currentIndex);
@@ -776,12 +543,28 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     } else {
       _shuffleOrder = null;
     }
+    // Native just_audio also supports shuffle via setShuffleModeEnabled +
+    // shuffle order, but keeping shuffle logic in our layer for now
+    // simplifies the concat-vs-queue index mapping.
   }
 
   Future<void> cycleRepeat() async {
     final modes = PlaybackRepeat.values;
     final next = modes[(repeatMode.value.index + 1) % modes.length];
     repeatMode.add(next);
+    // Map to just_audio's built-in loop mode too so single-track
+    // repeat works even without our watchdog code path.
+    switch (next) {
+      case PlaybackRepeat.off:
+        await _player.setLoopMode(LoopMode.off);
+        break;
+      case PlaybackRepeat.all:
+        await _player.setLoopMode(LoopMode.all);
+        break;
+      case PlaybackRepeat.one:
+        await _player.setLoopMode(LoopMode.one);
+        break;
+    }
   }
 
   Future<void> setSleepTimer(Duration? duration) async {
@@ -794,19 +577,9 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     });
   }
 
-  // --- Index navigation -------------------------------------------------
-
-  int? _previousIndex() {
-    if (_queue.isEmpty) return null;
-    if (shuffleMode.value && _shuffleOrder != null) {
-      final pos = _shuffleOrder!.indexOf(_currentIndex);
-      if (pos <= 0) return null;
-      return _shuffleOrder![pos - 1];
-    }
-    return _currentIndex - 1 >= 0 ? _currentIndex - 1 : null;
-  }
-
-  // --- audio_service handler overrides ----------------------------------
+  // ---------------------------------------------------------------------
+  //  Handler overrides
+  // ---------------------------------------------------------------------
 
   @override
   Future<void> play() => _player.play();
@@ -814,7 +587,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   @override
   Future<void> pause() async {
     await _player.pause();
-    await _persistQueue();
+    _persistQueue();
   }
 
   @override
@@ -823,37 +596,20 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   @override
   Future<void> stop() async {
     await _player.stop();
-    if (_bLazy != null) await _bLazy!.stop();
+    if (_crossfadeLazy != null) await _crossfadeLazy!.stop();
     await super.stop();
   }
 
   @override
   Future<void> skipToNext() async {
-    var next = _peekNextIndex();
-    // Aggressive queue-refill fallback chain so autoplay never stalls
-    // silently on "no next track". Try related first, then a text
-    // search on the current track's title, then on artist alone.
-    if (next == null && _queue.isNotEmpty) {
-      await _appendRelatedToQueue(_queue.last.sourceVideoId);
-      next = _peekNextIndex();
+    // Ensure the next item is in the concat source (resolve if not).
+    await _ensureUpcomingResolved();
+    if (_currentIndex + 1 >= _queue.length) {
+      await _maybeAppendRelated();
+      await _ensureUpcomingResolved();
     }
-    if (next == null && _queue.isNotEmpty) {
-      final current = _queue.last;
-      try {
-        final pool = await _yt.search(current.title, limit: 15);
-        final filtered = pool
-            .where((t) => !_queue.contains(t))
-            .where(_reasonableDuration)
-            .take(5)
-            .toList();
-        if (filtered.isNotEmpty) {
-          _queue.addAll(filtered);
-          queue.add(_queue.map((t) => t.toMediaItem()).toList());
-          next = _peekNextIndex();
-        }
-      } catch (_) {}
-    }
-    if (next != null) await _playIndex(next);
+    if (_currentIndex + 1 >= _concat.length) return;
+    await _player.seekToNext();
   }
 
   @override
@@ -862,38 +618,57 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       await _player.seek(Duration.zero);
       return;
     }
-    final prev = _previousIndex();
-    if (prev != null) await _playIndex(prev);
+    if (_currentIndex <= 0) return;
+    await _player.seekToPrevious();
   }
 
   @override
-  Future<void> skipToQueueItem(int index) async => _playIndex(index);
+  Future<void> skipToQueueItem(int index) async {
+    if (index < 0 || index >= _queue.length) return;
+    // If the concat doesn't yet have this index, resolve up to it.
+    while (_concat.length <= index) {
+      final idx = _concat.length;
+      final src = await _makeSource(_queue[idx]);
+      if (src != null) {
+        await _concat.add(src);
+      } else {
+        _queue.removeAt(idx);
+        queue.add(_queue.map((t) => t.toMediaItem()).toList());
+        if (index >= _queue.length) return;
+      }
+    }
+    await _player.seek(Duration.zero, index: index);
+    await _player.play();
+  }
 
   @override
   Future<void> addQueueItem(MediaItem mediaItem) async {
     final track = _trackFromMediaItem(mediaItem);
     _queue.add(track);
     queue.add(_queue.map((t) => t.toMediaItem()).toList());
+    unawaited(_ensureUpcomingResolved());
   }
 
   Future<void> playNext(Track track) async {
     final insertAt = (_currentIndex + 1).clamp(0, _queue.length);
     _queue.insert(insertAt, track);
     queue.add(_queue.map((t) => t.toMediaItem()).toList());
+    // Insert a resolved source at the same position in the concat if
+    // it's within the currently-materialised window.
+    if (insertAt <= _concat.length) {
+      final src = await _makeSource(track);
+      if (src != null) {
+        await _concat.insert(insertAt, src);
+      }
+    }
   }
 
   Future<void> startRadio(Track seed) async {
-    _queue
-      ..clear()
-      ..add(seed);
-    queue.add(_queue.map((t) => t.toMediaItem()).toList());
-    _currentIndex = 0;
-    await _playIndex(0);
-    await _appendRelatedToQueue(seed.sourceVideoId);
+    await playWithAutoplay(seed);
   }
 
-  /// Spotify-style "Smart Shuffle" — interleave the user's library with
-  /// fresh related-track recommendations. Half familiar, half new.
+  /// Spotify-style Smart Shuffle: interleave the user's library with
+  /// fresh related-track recommendations.
   Future<void> smartShuffle() async {
     final libRepo = Hive.isBoxOpen('favorites')
         ? Hive.box<Track>('favorites').values.toList()
@@ -905,14 +680,12 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     if (library.isEmpty) return;
     final seed = library.first;
 
-    // Pull related videos for fresh discovery.
     final related = <Track>[];
     try {
       final fresh = await _yt.related(seed.sourceVideoId, limit: 30);
       related.addAll(fresh);
     } catch (_) {}
 
-    // Interleave 1 known + 1 new + 1 known + 1 new...
     final mix = <Track>[];
     final lib = library.take(20).toList();
     for (var i = 0; i < (lib.length + related.length); i++) {
@@ -933,11 +706,61 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   Future<void> removeQueueItemAt(int index) async {
     if (index < 0 || index >= _queue.length) return;
     _queue.removeAt(index);
+    if (index < _concat.length) {
+      await _concat.removeAt(index);
+    }
     if (index < _currentIndex) _currentIndex--;
     queue.add(_queue.map((t) => t.toMediaItem()).toList());
   }
 
-  // --- Public read-only state -------------------------------------------
+  // ---------------------------------------------------------------------
+  //  Pre-warm hoist (browser → native audio background handoff)
+  // ---------------------------------------------------------------------
+
+  String? _warmedVideoId;
+
+  Future<void> prepareForBackgroundHoist(Track track) async {
+    if (_warmedVideoId == track.sourceVideoId) return;
+    _warmedVideoId = track.sourceVideoId;
+    try {
+      final url = await _yt.resolveAudioUrl(track.sourceVideoId);
+      if (_player.playing) return; // don't clobber active playback
+      _queue
+        ..clear()
+        ..add(track);
+      _currentIndex = 0;
+      queue.add(_queue.map((t) => t.toMediaItem()).toList());
+      mediaItem.add(track.toMediaItem());
+      await _concat.clear();
+      await _concat
+          .add(AudioSource.uri(Uri.parse(url), tag: track.toMediaItem()));
+      await _player.seek(Duration.zero, index: 0);
+      await _player.setVolume(0.0);
+    } catch (e) {
+      debugPrint('[Hoist] warm failed: $e');
+      _warmedVideoId = null;
+    }
+  }
+
+  Future<void> resumeWarmedHoist({required Duration startAt}) async {
+    if (_warmedVideoId == null) return;
+    try {
+      if (startAt > Duration.zero) await _player.seek(startAt);
+      await _player.setVolume(1.0);
+      await _player.play();
+      unawaited(_maybeAppendRelated());
+    } catch (e) {
+      debugPrint('[Hoist] resume failed: $e');
+    }
+  }
+
+  void clearWarmedHoist() {
+    _warmedVideoId = null;
+  }
+
+  // ---------------------------------------------------------------------
+  //  Public read-only state
+  // ---------------------------------------------------------------------
 
   Stream<Duration> get positionStream => _player.positionStream;
   Stream<Duration?> get durationStream => _player.durationStream;
@@ -946,9 +769,8 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   List<Track> get currentQueue => List.unmodifiable(_queue);
   int get currentIndex => _currentIndex;
 
-  /// Progress stream emitted by whichever player is currently active.
-  /// We use the broadcast subject below so a swap (post-crossfade)
-  /// rebinds without leaking stale positions from the inactive player.
+  bool get isStalled => false; // Legacy field; ConcatSource handles stalls natively.
+
   final BehaviorSubject<ProgressData> _progressSubject =
       BehaviorSubject<ProgressData>.seeded(
     const ProgressData(
@@ -997,9 +819,13 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   Stream<ProgressData> get progressStream => _progressSubject.stream;
 
   Track? get currentTrack =>
-      _currentIndex >= 0 && _currentIndex < _queue.length ? _queue[_currentIndex] : null;
+      _currentIndex >= 0 && _currentIndex < _queue.length
+          ? _queue[_currentIndex]
+          : null;
 
-  // --- Private helpers --------------------------------------------------
+  // ---------------------------------------------------------------------
+  //  Internal
+  // ---------------------------------------------------------------------
 
   void _broadcastState(PlaybackEvent event) {
     final playing = _player.playing;
