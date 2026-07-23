@@ -28,6 +28,7 @@ class _CrossfadeSheetState extends State<CrossfadeSheet> {
   late int _seconds;
   late bool _auto;
   late bool _loudnessMatch;
+  late bool _debug;
 
   Box get _box => Hive.box('settings');
 
@@ -40,6 +41,7 @@ class _CrossfadeSheetState extends State<CrossfadeSheet> {
     _auto = _box.get('crossfadeAuto', defaultValue: false) as bool;
     _loudnessMatch =
         _box.get('crossfadeLoudnessMatch', defaultValue: true) as bool;
+    _debug = _box.get('crossfadeDebug', defaultValue: false) as bool;
   }
 
   @override
@@ -135,6 +137,23 @@ class _CrossfadeSheetState extends State<CrossfadeSheet> {
             onChanged: (v) {
               setState(() => _loudnessMatch = v);
               _box.put('crossfadeLoudnessMatch', v);
+            },
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Show fade events (debug)'),
+            subtitle: Text(
+              'Snackbar messages when the fade preloads, fires, and '
+              'completes. Use to verify the fade is actually kicking in.',
+              style: TextStyle(
+                fontSize: 11,
+                color: scheme.onSurface.withValues(alpha: 0.65),
+              ),
+            ),
+            value: _debug,
+            onChanged: (v) {
+              setState(() => _debug = v);
+              _box.put('crossfadeDebug', v);
             },
           ),
           const SizedBox(height: 6),

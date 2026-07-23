@@ -36,16 +36,25 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _init();
   }
 
-  /// Main player. Plays a `ConcatenatingAudioSource` that grows as we
-  /// resolve upcoming tracks. just_audio auto-advances between items
-  /// natively so we never rely on Dart-side end-of-track detection.
-  final AudioPlayer _player = AudioPlayer();
+  /// Main player + its equalizer effect. The equalizer is attached
+  /// via an `AudioPipeline` so we can automate EQ bands during
+  /// crossfade transitions — this is the "3-band DJ mix" trick pro
+  /// software uses: bass gets swapped hard (high-pass on outgoing,
+  /// low-pass sweep on incoming) while mids/highs blend smoothly.
+  final AndroidEqualizer _eqOut = AndroidEqualizer();
+  late final AudioPlayer _player = AudioPlayer(
+    audioPipeline: AudioPipeline(androidAudioEffects: [_eqOut]),
+  );
 
-  /// Overlay player used only during crossfades. Lazily created so we
-  /// don't hold a second decoder + audio focus session when crossfade
-  /// is off (the default for many users).
+  /// Overlay player + its equalizer, used during crossfades. Lazy
+  /// because most sessions never crossfade — an idle player still
+  /// costs an audio-focus session.
+  final AndroidEqualizer _eqIn = AndroidEqualizer();
   AudioPlayer? _crossfadeLazy;
-  AudioPlayer get _crossfadePlayer => _crossfadeLazy ??= AudioPlayer();
+  AudioPlayer get _crossfadePlayer =>
+      _crossfadeLazy ??= AudioPlayer(
+        audioPipeline: AudioPipeline(androidAudioEffects: [_eqIn]),
+      );
 
   /// The backing playlist source for `_player`. We mutate it (`.add`,
   /// `.removeAt`) to grow / shrink the queue at runtime.
@@ -98,6 +107,14 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       preload: false,
       initialIndex: 0,
     );
+    // Enable the main equalizer so its bands are ready to be automated
+    // during crossfades. When crossfade is off (or between fades) all
+    // bands sit at 0 dB gain — a no-op.
+    try {
+      await _eqOut.setEnabled(true);
+    } catch (e) {
+      debugPrint('[EQ] main equalizer enable failed: $e');
+    }
     _restoreQueue();
   }
 
@@ -435,6 +452,10 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
           _overlayPreloadedFor != nextTrack.sourceVideoId &&
           !_overlayPreloading) {
         _overlayPreloading = true;
+        final debug = Hive.isBoxOpen('settings') &&
+            (Hive.box('settings')
+                .get('crossfadeDebug', defaultValue: false) as bool);
+        if (debug) errorEvents.add('🔄 Preloading next track for fade');
         Future(() async {
           try {
             final url =
@@ -446,8 +467,10 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
             await _crossfadePlayer.setVolume(0.0);
             _overlayPreloadedFor = nextTrack.sourceVideoId;
             debugPrint('[AutoMix] overlay preloaded for ${nextTrack.title}');
+            if (debug) errorEvents.add('✅ Preload done');
           } catch (e) {
             debugPrint('[AutoMix] preload failed: $e');
+            if (debug) errorEvents.add('❌ Preload failed: $e');
           } finally {
             _overlayPreloading = false;
           }
@@ -495,6 +518,37 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         .get('crossfadeLoudnessMatch', defaultValue: true) as bool;
   }
 
+  /// Bass-band gain (dB) for the OUTGOING track during a crossfade,
+  /// parameterised by transition progress `t` in [0, 1].
+  ///
+  /// Outgoing bass is pulled down aggressively in the first 40 % of
+  /// the fade so it's essentially gone by the time the incoming bass
+  /// starts blooming — the "kick swap" trick used by pro DJ software.
+  ///
+  ///   t = 0.0  → 0 dB   (full bass, natural playback)
+  ///   t = 0.4  → -12 dB (bass killed)
+  ///   t = 1.0  → -12 dB (stays killed until handoff resets it)
+  double _bassSwapOut(double t) {
+    if (t <= 0) return 0;
+    if (t >= 0.4) return -12;
+    return -12 * (t / 0.4);
+  }
+
+  /// Bass-band gain (dB) for the INCOMING track during a crossfade.
+  ///
+  /// Incoming bass stays suppressed for the first 60 % so it doesn't
+  /// clash with the outgoing track's rhythm, then blooms up to full
+  /// over the remaining 40 %.
+  ///
+  ///   t = 0.0  → -12 dB (bass suppressed, only mids/highs blend in)
+  ///   t = 0.6  → -12 dB (still suppressed — kick swap zone)
+  ///   t = 1.0  → 0 dB   (full bass, natural playback resumes)
+  double _bassSwapIn(double t) {
+    if (t <= 0.6) return -12;
+    if (t >= 1.0) return 0;
+    return -12 + 12 * ((t - 0.6) / 0.4);
+  }
+
   /// Runs a two-player crossfade between the current track (fading
   /// out on `_player`) and the next track (fading in on the pre-loaded
   /// `_crossfadePlayer`). The fade completes BEFORE the natural end
@@ -515,12 +569,19 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
     final nextTrack = _queue[toIndex];
     final overlay = _crossfadePlayer;
+    final preloaded = _overlayPreloadedFor == nextTrack.sourceVideoId;
 
-    // Ensure the overlay is loaded with the incoming track. Ideally
-    // this was pre-loaded by phase 1 of the watchdog and is a no-op.
-    // The fallback path (~1 s of setup latency) still works but the
-    // fade timing will be less precise.
-    if (_overlayPreloadedFor != nextTrack.sourceVideoId) {
+    // Only surface debug snackbars when the user has explicitly turned
+    // them on via the Crossfade sheet — keeps the normal UX quiet.
+    final debug = Hive.isBoxOpen('settings') &&
+        (Hive.box('settings').get('crossfadeDebug', defaultValue: false)
+            as bool);
+    if (debug) {
+      errorEvents.add(
+          preloaded ? '🎚️ Fade → next track' : '🎚️ Fade (loading next…)');
+    }
+
+    if (!preloaded) {
       try {
         final url = await _yt.resolveAudioUrl(nextTrack.sourceVideoId);
         await overlay.setAudioSource(
@@ -546,6 +607,21 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       return;
     }
 
+    // Enable the overlay's equalizer so we can automate bass on the
+    // incoming track. Also grab both equalizers' band lists so we can
+    // animate them during the fade.
+    try {
+      await _eqIn.setEnabled(true);
+    } catch (_) {}
+    List<AndroidEqualizerBand> outBands = const [];
+    List<AndroidEqualizerBand> inBands = const [];
+    try {
+      outBands = (await _eqOut.parameters).bands;
+      inBands = (await _eqIn.parameters).bands;
+    } catch (e) {
+      debugPrint('[EQ] band lookup failed: $e');
+    }
+
     // Loudness match — cap incoming, pad outgoing so a jarring-loud
     // next track doesn't slam over a mellow current one.
     final match = _loudnessMatchEnabled();
@@ -556,17 +632,56 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     final stepInterval =
         Duration(milliseconds: durationSeconds * 1000 ~/ steps);
 
+    // DJ-style 3-band EQ automation during the crossfade:
+    //   * Bass (band 0, ~60 Hz) — swap hard. Outgoing bass ramps
+    //     down to −12 dB before the midpoint; incoming bass ramps
+    //     from −12 dB up to 0 dB after the midpoint. Only ONE track
+    //     has audible bass at any instant, which is what makes DJ
+    //     mixes not sound muddy.
+    //   * Mid (band 2, ~1 kHz) — cross-blend linearly.
+    //   * High (band 4, ~14 kHz) — cross-blend linearly. Both
+    //     tracks share high frequencies for the whole fade, which
+    //     is what makes the transition feel "connected" instead of
+    //     abrupt.
+    // On devices where the equalizer isn't available (some Xiaomi
+    // MIUI builds) the band list is empty and we fall back to a
+    // pure volume crossfade — still works, just less DJ-flavoured.
     for (var i = 1; i <= steps; i++) {
       final t = i / steps;
-      // Equal-power crossfade — sounds smoother than a linear ramp.
+      // Equal-power volume curve — smoother than linear.
       final outVol = (cos(t * pi / 2) * outPeak).clamp(0.0, 1.0);
       final inVol = (sin(t * pi / 2) * inPeak).clamp(0.0, 1.0);
       try {
         await _player.setVolume(outVol);
         await overlay.setVolume(inVol);
       } catch (_) {}
+
+      // EQ automation — swap the bass, blend the rest.
+      // Bass swap curve: outgoing 0 → -12 dB over t=[0, 0.4]; incoming
+      // -12 → 0 dB over t=[0.6, 1.0]. In the middle 20 %, both are
+      // essentially bass-free → the "kick swap" pro DJs use.
+      if (outBands.isNotEmpty) {
+        final bassGainOut = _bassSwapOut(t);
+        try {
+          await outBands[0].setGain(bassGainOut);
+        } catch (_) {}
+      }
+      if (inBands.isNotEmpty) {
+        final bassGainIn = _bassSwapIn(t);
+        try {
+          await inBands[0].setGain(bassGainIn);
+        } catch (_) {}
+      }
       await Future.delayed(stepInterval);
       if (!_crossfading) break;
+    }
+
+    // After the fade — reset the outgoing bass band so it doesn't
+    // carry a -12 dB setting into the next natural transition.
+    if (outBands.isNotEmpty) {
+      try {
+        await outBands[0].setGain(0);
+      } catch (_) {}
     }
 
     // Handoff — pause main *before* seeking so its concat never gets a
@@ -672,6 +787,23 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     await _player.stop();
     if (_crossfadeLazy != null) await _crossfadeLazy!.stop();
     await super.stop();
+  }
+
+  /// Called by audio_service when the user dismisses the app from the
+  /// recents view on Android. The default behavior is to keep audio
+  /// playing (this is fine for Spotify-style "background music won't
+  /// die when I swipe the app away"), but the user's expectation for
+  /// MewSify is that swipe-from-recents = stop. Honour that by
+  /// stopping the players and telling audio_service to idle so its
+  /// foreground notification comes down.
+  @override
+  Future<void> onTaskRemoved() async {
+    debugPrint('[Handler] task removed — stopping playback');
+    await stop();
+    playbackState.add(playbackState.value.copyWith(
+      processingState: AudioProcessingState.idle,
+      playing: false,
+    ));
   }
 
   @override
