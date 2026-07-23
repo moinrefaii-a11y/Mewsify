@@ -83,6 +83,13 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   bool _crossfading = false;
   bool _resolvingNext = false;
 
+  /// Pre-loaded video id on the overlay player. Set by the watchdog
+  /// when we're 10-15 s from the end of the current track, so when
+  /// the actual crossfade fires the overlay is ready to play with
+  /// zero setup latency.
+  String? _overlayPreloadedFor;
+  bool _overlayPreloading = false;
+
   Future<void> _init() async {
     _bindPlayerListeners();
     _bindProgress();
@@ -390,10 +397,17 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   // ---------------------------------------------------------------------
 
   /// Every 250 ms while the main player is playing, check whether we
-  /// should be running a crossfade to the next item. If yes, fire it
-  /// off. The main player still auto-advances on its own timeline
-  /// (silently, because we ramp its volume to 0); the overlay player
-  /// carries the audible transition.
+  /// should:
+  ///   1. Pre-load the overlay with the next track's audio source
+  ///      (so we're ready to fade with zero setup latency when the
+  ///      moment arrives), or
+  ///   2. Fire the actual crossfade.
+  ///
+  /// The overlay is preloaded at "last 10-15 s remaining" and the
+  /// fade itself fires at "last N+0.5 s remaining" so the fade
+  /// finishes cleanly BEFORE the outgoing track's natural end. This
+  /// avoids the "main auto-advances mid-fade → double audio →
+  /// echo instead of crossfade" bug.
   void _scheduleCrossfade() {
     _crossfadeWatchdog?.cancel();
     _crossfadeWatchdog =
@@ -406,12 +420,48 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       final rmMs = (dur - pos).inMilliseconds;
       final seconds = _crossfadeSeconds();
       if (seconds <= 0) return;
-      // Only run the fade if there's a next item queued and we're
-      // within the fade window (with a 300 ms lead so the fade starts
-      // just before the natural end).
-      if (rmMs > 200 && rmMs <= seconds * 1000 + 300) {
-        final nextIdx = _currentIndex + 1;
-        if (nextIdx >= _queue.length) return;
+      final nextIdx = _currentIndex + 1;
+      if (nextIdx >= _queue.length) return;
+      final nextTrack = _queue[nextIdx];
+
+      // Phase 1 — preload the overlay ahead of the fade window.
+      // Warms the audio source so the fade can start audibly on the
+      // first ramp tick instead of after ~1 s of network + decoder
+      // setup.
+      final preloadFrom = seconds * 1000 + 500;
+      final preloadTo = seconds * 1000 + 8000;
+      if (rmMs > preloadFrom &&
+          rmMs <= preloadTo &&
+          _overlayPreloadedFor != nextTrack.sourceVideoId &&
+          !_overlayPreloading) {
+        _overlayPreloading = true;
+        Future(() async {
+          try {
+            final url =
+                await _yt.resolveAudioUrl(nextTrack.sourceVideoId);
+            await _crossfadePlayer.setAudioSource(
+              AudioSource.uri(Uri.parse(url)),
+              preload: true,
+            );
+            await _crossfadePlayer.setVolume(0.0);
+            _overlayPreloadedFor = nextTrack.sourceVideoId;
+            debugPrint('[AutoMix] overlay preloaded for ${nextTrack.title}');
+          } catch (e) {
+            debugPrint('[AutoMix] preload failed: $e');
+          } finally {
+            _overlayPreloading = false;
+          }
+        });
+      }
+
+      // Phase 2 — trigger the fade. Firing at N+500 ms lets the fade
+      // COMPLETE 500 ms BEFORE the natural end of the outgoing track,
+      // so main never auto-advances mid-fade.
+      final fireFrom = 200;
+      final fireTo = seconds * 1000 + 500;
+      if (rmMs > fireFrom && rmMs <= fireTo) {
+        debugPrint(
+            '[AutoMix] firing crossfade to ${nextTrack.title} at ${rmMs}ms remaining');
         await _startCrossfade(toIndex: nextIdx, durationSeconds: seconds);
       }
     });
@@ -445,10 +495,15 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         .get('crossfadeLoudnessMatch', defaultValue: true) as bool;
   }
 
-  /// Runs a two-player crossfade between the current track (fading out
-  /// on `_player`) and the next track (fading in on `_crossfadePlayer`).
-  /// After the fade we resync the main player's position to the
-  /// overlay's and hand playback back to the main pipeline.
+  /// Runs a two-player crossfade between the current track (fading
+  /// out on `_player`) and the next track (fading in on the pre-loaded
+  /// `_crossfadePlayer`). The fade completes BEFORE the natural end
+  /// of the outgoing track, then we hand playback back to the main
+  /// player: pause main, seek it to the overlay's position on the
+  /// next index, restore volume, pause overlay. Because main never
+  /// hits its own natural end, its ConcatenatingAudioSource never
+  /// fires an auto-advance during the fade — no double audio, no
+  /// echo, clean crossfade.
   Future<void> _startCrossfade({
     required int toIndex,
     required int durationSeconds,
@@ -461,22 +516,37 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     final nextTrack = _queue[toIndex];
     final overlay = _crossfadePlayer;
 
+    // Ensure the overlay is loaded with the incoming track. Ideally
+    // this was pre-loaded by phase 1 of the watchdog and is a no-op.
+    // The fallback path (~1 s of setup latency) still works but the
+    // fade timing will be less precise.
+    if (_overlayPreloadedFor != nextTrack.sourceVideoId) {
+      try {
+        final url = await _yt.resolveAudioUrl(nextTrack.sourceVideoId);
+        await overlay.setAudioSource(
+          AudioSource.uri(Uri.parse(url)),
+          preload: true,
+        );
+        _overlayPreloadedFor = nextTrack.sourceVideoId;
+      } catch (e) {
+        _crossfading = false;
+        errorEvents.add('Could not preload next track: $e');
+        _scheduleCrossfade();
+        return;
+      }
+    }
     try {
-      final url = await _yt.resolveAudioUrl(nextTrack.sourceVideoId);
-      await overlay.setAudioSource(
-        AudioSource.uri(Uri.parse(url)),
-        preload: true,
-      );
+      await overlay.seek(Duration.zero);
       await overlay.setVolume(0.0);
       await overlay.play();
     } catch (e) {
       _crossfading = false;
-      errorEvents.add('Could not preload next track for crossfade: $e');
+      errorEvents.add('Overlay failed to start: $e');
       _scheduleCrossfade();
       return;
     }
 
-    // Loudness match: cap incoming and pad outgoing so a jarring-loud
+    // Loudness match — cap incoming, pad outgoing so a jarring-loud
     // next track doesn't slam over a mellow current one.
     final match = _loudnessMatchEnabled();
     final inPeak = match ? 0.92 : 1.0;
@@ -488,7 +558,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
     for (var i = 1; i <= steps; i++) {
       final t = i / steps;
-      // Equal-power curve sounds smoother than a linear ramp.
+      // Equal-power crossfade — sounds smoother than a linear ramp.
       final outVol = (cos(t * pi / 2) * outPeak).clamp(0.0, 1.0);
       final inVol = (sin(t * pi / 2) * inPeak).clamp(0.0, 1.0);
       try {
@@ -499,26 +569,30 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       if (!_crossfading) break;
     }
 
-    // Hand playback back to the main player. During the fade the main
-    // player may have auto-advanced from the outgoing track to the
-    // incoming one at position 0 — sync it to where the overlay
-    // actually is, then restore volume.
+    // Handoff — pause main *before* seeking so its concat never gets a
+    // chance to auto-advance on its own timeline. Seek main to
+    // overlay's live position on the next queue index, restore volume,
+    // resume main, pause overlay. The transition is inaudible because
+    // main was already at volume 0 and overlay was at target volume.
     try {
-      final overlayPos = overlay.position;
-      if (_player.currentIndex != toIndex) {
-        await _player.seek(overlayPos, index: toIndex);
-      } else {
-        await _player.seek(overlayPos);
-      }
+      await _player.pause();
+      await _player.seek(overlay.position, index: toIndex);
       await _player.setVolume(1.0);
-      await overlay.setVolume(0.0);
+      await _player.play();
       await overlay.pause();
+      await overlay.setVolume(0.0);
     } catch (e) {
-      debugPrint('[Crossfade] handoff failed: $e');
+      debugPrint('[AutoMix] handoff failed: $e');
+      // Best-effort recovery — force main to keep playing something.
+      try {
+        await _player.setVolume(1.0);
+        await _player.play();
+      } catch (_) {}
     }
 
     _crossfading = false;
     _currentIndex = toIndex;
+    _overlayPreloadedFor = null; // ready to preload the next-next track
     mediaItem.add(nextTrack.toMediaItem());
     _scheduleCrossfade();
     unawaited(_ensureUpcomingResolved());
