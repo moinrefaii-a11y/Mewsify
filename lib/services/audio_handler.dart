@@ -36,25 +36,23 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _init();
   }
 
-  /// Main player + its equalizer effect. The equalizer is attached
-  /// via an `AudioPipeline` so we can automate EQ bands during
-  /// crossfade transitions — this is the "3-band DJ mix" trick pro
-  /// software uses: bass gets swapped hard (high-pass on outgoing,
-  /// low-pass sweep on incoming) while mids/highs blend smoothly.
-  final AndroidEqualizer _eqOut = AndroidEqualizer();
-  late final AudioPlayer _player = AudioPlayer(
-    audioPipeline: AudioPipeline(androidAudioEffects: [_eqOut]),
-  );
+  /// Main player. Plays a `ConcatenatingAudioSource` that grows as we
+  /// resolve upcoming tracks. just_audio auto-advances between items
+  /// natively so we never rely on Dart-side end-of-track detection.
+  ///
+  /// v0.7.0 tried to attach an `AudioPipeline` with `AndroidEqualizer`
+  /// here for DJ-style bass swapping during crossfades. That regressed
+  /// playback on some devices (Xiaomi/MIUI's platform Equalizer
+  /// service is famously flaky and takes the player down with it).
+  /// Reverting to plain players; the equalizer path can come back
+  /// later behind a "try it and fall back gracefully" wrapper.
+  final AudioPlayer _player = AudioPlayer();
 
-  /// Overlay player + its equalizer, used during crossfades. Lazy
-  /// because most sessions never crossfade — an idle player still
-  /// costs an audio-focus session.
-  final AndroidEqualizer _eqIn = AndroidEqualizer();
+  /// Overlay player used only during crossfades. Lazy — most sessions
+  /// never crossfade, and an idle player still holds an audio-focus
+  /// session.
   AudioPlayer? _crossfadeLazy;
-  AudioPlayer get _crossfadePlayer =>
-      _crossfadeLazy ??= AudioPlayer(
-        audioPipeline: AudioPipeline(androidAudioEffects: [_eqIn]),
-      );
+  AudioPlayer get _crossfadePlayer => _crossfadeLazy ??= AudioPlayer();
 
   /// The backing playlist source for `_player`. We mutate it (`.add`,
   /// `.removeAt`) to grow / shrink the queue at runtime.
@@ -107,14 +105,6 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       preload: false,
       initialIndex: 0,
     );
-    // Enable the main equalizer so its bands are ready to be automated
-    // during crossfades. When crossfade is off (or between fades) all
-    // bands sit at 0 dB gain — a no-op.
-    try {
-      await _eqOut.setEnabled(true);
-    } catch (e) {
-      debugPrint('[EQ] main equalizer enable failed: $e');
-    }
     _restoreQueue();
   }
 
@@ -518,36 +508,7 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         .get('crossfadeLoudnessMatch', defaultValue: true) as bool;
   }
 
-  /// Bass-band gain (dB) for the OUTGOING track during a crossfade,
-  /// parameterised by transition progress `t` in [0, 1].
-  ///
-  /// Outgoing bass is pulled down aggressively in the first 40 % of
-  /// the fade so it's essentially gone by the time the incoming bass
-  /// starts blooming — the "kick swap" trick used by pro DJ software.
-  ///
-  ///   t = 0.0  → 0 dB   (full bass, natural playback)
-  ///   t = 0.4  → -12 dB (bass killed)
-  ///   t = 1.0  → -12 dB (stays killed until handoff resets it)
-  double _bassSwapOut(double t) {
-    if (t <= 0) return 0;
-    if (t >= 0.4) return -12;
-    return -12 * (t / 0.4);
-  }
 
-  /// Bass-band gain (dB) for the INCOMING track during a crossfade.
-  ///
-  /// Incoming bass stays suppressed for the first 60 % so it doesn't
-  /// clash with the outgoing track's rhythm, then blooms up to full
-  /// over the remaining 40 %.
-  ///
-  ///   t = 0.0  → -12 dB (bass suppressed, only mids/highs blend in)
-  ///   t = 0.6  → -12 dB (still suppressed — kick swap zone)
-  ///   t = 1.0  → 0 dB   (full bass, natural playback resumes)
-  double _bassSwapIn(double t) {
-    if (t <= 0.6) return -12;
-    if (t >= 1.0) return 0;
-    return -12 + 12 * ((t - 0.6) / 0.4);
-  }
 
   /// Runs a two-player crossfade between the current track (fading
   /// out on `_player`) and the next track (fading in on the pre-loaded
@@ -607,21 +568,6 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       return;
     }
 
-    // Enable the overlay's equalizer so we can automate bass on the
-    // incoming track. Also grab both equalizers' band lists so we can
-    // animate them during the fade.
-    try {
-      await _eqIn.setEnabled(true);
-    } catch (_) {}
-    List<AndroidEqualizerBand> outBands = const [];
-    List<AndroidEqualizerBand> inBands = const [];
-    try {
-      outBands = (await _eqOut.parameters).bands;
-      inBands = (await _eqIn.parameters).bands;
-    } catch (e) {
-      debugPrint('[EQ] band lookup failed: $e');
-    }
-
     // Loudness match — cap incoming, pad outgoing so a jarring-loud
     // next track doesn't slam over a mellow current one.
     final match = _loudnessMatchEnabled();
@@ -632,20 +578,6 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     final stepInterval =
         Duration(milliseconds: durationSeconds * 1000 ~/ steps);
 
-    // DJ-style 3-band EQ automation during the crossfade:
-    //   * Bass (band 0, ~60 Hz) — swap hard. Outgoing bass ramps
-    //     down to −12 dB before the midpoint; incoming bass ramps
-    //     from −12 dB up to 0 dB after the midpoint. Only ONE track
-    //     has audible bass at any instant, which is what makes DJ
-    //     mixes not sound muddy.
-    //   * Mid (band 2, ~1 kHz) — cross-blend linearly.
-    //   * High (band 4, ~14 kHz) — cross-blend linearly. Both
-    //     tracks share high frequencies for the whole fade, which
-    //     is what makes the transition feel "connected" instead of
-    //     abrupt.
-    // On devices where the equalizer isn't available (some Xiaomi
-    // MIUI builds) the band list is empty and we fall back to a
-    // pure volume crossfade — still works, just less DJ-flavoured.
     for (var i = 1; i <= steps; i++) {
       final t = i / steps;
       // Equal-power volume curve — smoother than linear.
@@ -655,33 +587,8 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         await _player.setVolume(outVol);
         await overlay.setVolume(inVol);
       } catch (_) {}
-
-      // EQ automation — swap the bass, blend the rest.
-      // Bass swap curve: outgoing 0 → -12 dB over t=[0, 0.4]; incoming
-      // -12 → 0 dB over t=[0.6, 1.0]. In the middle 20 %, both are
-      // essentially bass-free → the "kick swap" pro DJs use.
-      if (outBands.isNotEmpty) {
-        final bassGainOut = _bassSwapOut(t);
-        try {
-          await outBands[0].setGain(bassGainOut);
-        } catch (_) {}
-      }
-      if (inBands.isNotEmpty) {
-        final bassGainIn = _bassSwapIn(t);
-        try {
-          await inBands[0].setGain(bassGainIn);
-        } catch (_) {}
-      }
       await Future.delayed(stepInterval);
       if (!_crossfading) break;
-    }
-
-    // After the fade — reset the outgoing bass band so it doesn't
-    // carry a -12 dB setting into the next natural transition.
-    if (outBands.isNotEmpty) {
-      try {
-        await outBands[0].setGain(0);
-      } catch (_) {}
     }
 
     // Handoff — pause main *before* seeking so its concat never gets a
