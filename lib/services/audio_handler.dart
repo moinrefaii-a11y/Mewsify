@@ -82,13 +82,24 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _eventSub = _player.playbackEventStream.listen(
       _broadcastState,
       onError: (Object e, StackTrace st) {
+        // The current stream URL blew up (403, geo-block, DRM, etc.).
+        // Instead of freezing on a broken track, surface a snackbar and
+        // *auto-advance* so the user isn't stranded.
         _completionEnabled = false;
-        errorEvents.add('Could not play: $e');
+        errorEvents.add('Skipping: could not play this track');
+        debugPrint('[Player] error, auto-skipping: $e');
+        Future.microtask(() async {
+          try {
+            await skipToNext();
+          } catch (_) {}
+        });
       },
     );
 
     _stateSub = _player.processingStateStream.listen((state) {
-      if (state == ProcessingState.completed && _completionEnabled && !_crossfading) {
+      if (state == ProcessingState.completed &&
+          _completionEnabled &&
+          !_crossfading) {
         _onTrackCompleted();
       }
       if (state == ProcessingState.ready) {
@@ -226,8 +237,16 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         await Future.delayed(const Duration(milliseconds: 800));
         return _playIndex(index, retryCount + 1);
       }
-      _completionEnabled = false;
-      errorEvents.add('Could not load track: $e');
+      // Auto-recover — advance to the next track instead of leaving the
+      // user stuck. Only bail entirely if there *is* no next track.
+      debugPrint('[Player] resolve failed for ${track.title}: $e');
+      errorEvents.add('Skipped "${track.title}" — could not stream');
+      final next = _peekNextIndex();
+      if (next != null && next != index) {
+        await _playIndex(next);
+      } else {
+        _completionEnabled = false;
+      }
     }
   }
 
@@ -268,17 +287,30 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         }
       }
 
-      // 2) Track-end fallback. Only fires when we're right at the end AND
-      // completionEnabled is still true (meaning the natural completion
-      // event never came).
-      if (rmMs <= 250 && rmMs > -3000 && _completionEnabled) {
+      // 2) Track-end fallback. Fires whenever we're within 300 ms of
+      // the natural end of the track and we're not already mid-fade or
+      // mid-advance. Ignores `_completionEnabled` — a stuck-false flag
+      // was the exact bug that left users stranded at the end of a
+      // track when just_audio silently ate the `completed` event.
+      if (rmMs <= 300 && rmMs > -3000 && !_advancing) {
+        _advancing = true;
         _completionEnabled = false;
         debugPrint(
-            '[Watchdog] forcing track end (no completion event fired)');
-        await _onTrackCompleted();
+            '[Watchdog] forcing track end at ${rmMs}ms remaining');
+        try {
+          await _onTrackCompleted();
+        } finally {
+          // Reset after a short cooldown so the next track can be
+          // completion-detected too.
+          Future.delayed(const Duration(seconds: 1), () {
+            _advancing = false;
+          });
+        }
       }
     });
   }
+
+  bool _advancing = false;
 
   int _crossfadeSeconds() {
     if (!Hive.isBoxOpen('settings')) return 5;

@@ -211,16 +211,22 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
               onWebViewCreated: (controller) => _controller = controller,
               onLoadStart: (_, uri) {
                 _currentUri = uri;
+                ref.read(browserCurrentUrlProvider.notifier).state =
+                    uri?.toString();
                 if (mounted) setState(() => _loading = true);
               },
               onLoadStop: (controller, uri) async {
                 _currentUri = uri;
+                ref.read(browserCurrentUrlProvider.notifier).state =
+                    uri?.toString();
                 _canGoBack = await controller.canGoBack();
                 await _applyAdSkipAndCleanup(controller);
                 if (mounted) setState(() => _loading = false);
               },
               onUpdateVisitedHistory: (_, uri, __) {
                 _currentUri = uri;
+                ref.read(browserCurrentUrlProvider.notifier).state =
+                    uri?.toString();
               },
             ),
           ),

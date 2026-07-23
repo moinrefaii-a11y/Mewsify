@@ -22,18 +22,91 @@ class MainShell extends ConsumerStatefulWidget {
   ConsumerState<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends ConsumerState<MainShell> {
+class _MainShellState extends ConsumerState<MainShell>
+    with WidgetsBindingObserver {
   int _index = 0;
+  // Which tab index is the Browse tab? Depends on the platform because
+  // web builds don't include Browse.
+  static const int _browseTabIndex = 2;
 
   // Track which tabs have been visited to defer building until first visit.
   final Set<int> _visited = {0};
 
   bool _updateChecked = false;
 
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// Backgrounding while a YouTube watch page is loaded in the Browse
+  /// tab kills the WebView's audio (that's a Chromium constraint we
+  /// can't override). To make the "browser video keeps playing in
+  /// background" behaviour work anyway, we hoist the currently visible
+  /// video into MewSify's own native audio pipeline the moment the app
+  /// goes inactive.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (kIsWeb) return;
+    if (state != AppLifecycleState.paused &&
+        state != AppLifecycleState.inactive) {
+      return;
+    }
+    if (_index != _browseTabIndex) return;
+    final urlStr = ref.read(browserCurrentUrlProvider);
+    if (urlStr == null || urlStr.isEmpty) return;
+    Uri uri;
+    try {
+      uri = Uri.parse(urlStr);
+    } catch (_) {
+      return;
+    }
+    final id = _extractVideoId(uri);
+    if (id == null) return;
+    _hoistToNative(id);
+  }
+
+  Future<void> _hoistToNative(String videoId) async {
+    // Only hoist if we're *not* already playing this exact track — the
+    // user might already be listening via native audio and just have
+    // the browser tab open.
+    final currentTrack = ref.read(currentTrackProvider).valueOrNull;
+    if (currentTrack != null && currentTrack.sourceVideoId == videoId) return;
+    try {
+      final yt = ref.read(youtubeSourceProvider);
+      final track = await yt.getTrack(videoId);
+      await ref.read(audioHandlerProvider).playWithAutoplay(track);
+      await ref.read(libraryProvider).recordPlay(track);
+    } catch (e) {
+      debugPrint('[BackgroundHoist] failed: $e');
+    }
+  }
+
+  String? _extractVideoId(Uri uri) {
+    if (uri.host.contains('youtube.com')) {
+      final v = uri.queryParameters['v'];
+      if (v != null && v.isNotEmpty) return v;
+      final segs = uri.pathSegments;
+      final shortsIdx = segs.indexOf('shorts');
+      if (shortsIdx != -1 && shortsIdx + 1 < segs.length) {
+        return segs[shortsIdx + 1];
+      }
+    } else if (uri.host == 'youtu.be' && uri.pathSegments.isNotEmpty) {
+      return uri.pathSegments.first;
+    }
+    return null;
+  }
+
   void _maybeShowUpdate() {
     if (_updateChecked) return;
     _updateChecked = true;
-    // Kick off in the next frame so the initial build finishes first.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.listenManual(updateCheckProvider, (_, next) {
         final info = next.valueOrNull;
@@ -78,8 +151,7 @@ class _MainShellState extends ConsumerState<MainShell> {
   Widget build(BuildContext context) {
     _maybeShowUpdate();
 
-    // Show playback errors as a snackbar so the user knows why audio
-    // isn't progressing instead of staring at a silent paused player.
+    // Surface playback errors as snackbars.
     ref.listen(playerErrorProvider, (_, next) {
       final msg = next.valueOrNull;
       if (msg == null) return;
@@ -89,6 +161,10 @@ class _MainShellState extends ConsumerState<MainShell> {
           SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
         );
     });
+
+    // Hide the mini player on the Browse tab so it doesn't sit on top
+    // of the YouTube UI (the browser tab has its own top-bar controls).
+    final showMiniPlayer = kIsWeb || _index != _browseTabIndex;
 
     return Scaffold(
       body: IndexedStack(
@@ -101,7 +177,7 @@ class _MainShellState extends ConsumerState<MainShell> {
       bottomNavigationBar: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const MiniPlayer(),
+          if (showMiniPlayer) const MiniPlayer(),
           NavigationBar(
             animationDuration: const Duration(milliseconds: 400),
             selectedIndex: _index,

@@ -141,6 +141,12 @@ final sleepTimerProvider = StreamProvider<Duration?>((ref) {
   return ref.watch(audioHandlerProvider).sleepTimer.stream;
 });
 
+/// Current URL the Browse tab's WebView is on. Used by the shell to
+/// hoist an in-browser YouTube video into the native audio queue when
+/// the app is backgrounded (so playback continues instead of stopping
+/// as soon as the WebView loses its surface).
+final browserCurrentUrlProvider = StateProvider<String?>((_) => null);
+
 /// The currently playing track (or null when nothing is playing).
 final currentTrackProvider = StreamProvider<Track?>((ref) {
   final handler = ref.watch(audioHandlerProvider);
