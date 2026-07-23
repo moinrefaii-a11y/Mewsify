@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -106,21 +108,103 @@ class MiniPlayer extends ConsumerWidget {
     ));
   }
 
+  /// Spotify-style expand.
+  ///
+  /// We use a container-transform route: the artwork is heroed, and a
+  /// custom transition scales + translates the entire full player up
+  /// from the bottom while the mini-player's row fades out. Draggable
+  /// close is handled inside PlayerScreen via its Navigator.pop on the
+  /// down-chevron and — for a real Spotify feel — a vertical drag.
   void _openPlayer(BuildContext context) {
     Navigator.of(context).push(
       PageRouteBuilder(
-        opaque: true,
-        fullscreenDialog: true,
-        transitionDuration: const Duration(milliseconds: 320),
-        reverseTransitionDuration: const Duration(milliseconds: 260),
-        pageBuilder: (_, __, ___) => const PlayerScreen(),
+        opaque: false,
+        barrierColor: Colors.transparent,
+        transitionDuration: const Duration(milliseconds: 380),
+        reverseTransitionDuration: const Duration(milliseconds: 320),
+        pageBuilder: (_, __, ___) => const _DraggablePlayer(),
         transitionsBuilder: (_, animation, __, child) {
-          final offset = Tween<Offset>(
+          // Combined slide-up + subtle scale for the natural "grow"
+          // motion; opacity ramps in at the tail so the mini isn't
+          // fighting the full player for pixels mid-transition.
+          final slide = Tween<Offset>(
             begin: const Offset(0, 1),
             end: Offset.zero,
-          ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic));
-          return SlideTransition(position: offset, child: child);
+          ).animate(CurvedAnimation(
+              parent: animation, curve: Curves.easeOutCubic));
+          final scale = Tween<double>(begin: 0.94, end: 1.0).animate(
+              CurvedAnimation(parent: animation, curve: Curves.easeOutCubic));
+          return SlideTransition(
+            position: slide,
+            child: ScaleTransition(
+              scale: scale,
+              alignment: Alignment.bottomCenter,
+              child: FadeTransition(
+                opacity: CurvedAnimation(
+                  parent: animation,
+                  curve: const Interval(0.1, 1.0),
+                ),
+                child: child,
+              ),
+            ),
+          );
         },
+      ),
+    );
+  }
+}
+
+/// Wraps [PlayerScreen] in a `GestureDetector` that closes the route
+/// when the user drags the view down more than a small threshold —
+/// mirroring the Spotify / Apple Music vertical dismiss gesture.
+class _DraggablePlayer extends StatefulWidget {
+  const _DraggablePlayer();
+
+  @override
+  State<_DraggablePlayer> createState() => _DraggablePlayerState();
+}
+
+class _DraggablePlayerState extends State<_DraggablePlayer>
+    with SingleTickerProviderStateMixin {
+  double _dragOffset = 0.0;
+  bool _draggingHeader = false;
+
+  static const _dismissThreshold = 90.0;
+
+  @override
+  Widget build(BuildContext context) {
+    // Translate the whole player during the drag so it visually
+    // follows the user's finger; when they let go we either dismiss
+    // (if past threshold) or spring back.
+    return GestureDetector(
+      // Only listen for vertical drags that started at the very top
+      // (first 120 px) — otherwise scrolling within the player would
+      // accidentally trigger dismiss.
+      onVerticalDragStart: (details) {
+        if (details.localPosition.dy < 120) {
+          _draggingHeader = true;
+        }
+      },
+      onVerticalDragUpdate: (details) {
+        if (!_draggingHeader) return;
+        setState(() {
+          _dragOffset = math.max(0, _dragOffset + details.delta.dy);
+        });
+      },
+      onVerticalDragEnd: (_) {
+        if (!_draggingHeader) return;
+        _draggingHeader = false;
+        if (_dragOffset > _dismissThreshold) {
+          Navigator.of(context).pop();
+        } else {
+          setState(() => _dragOffset = 0);
+        }
+      },
+      child: AnimatedContainer(
+        duration: Duration(milliseconds: _dragOffset == 0 ? 220 : 0),
+        curve: Curves.easeOutCubic,
+        transform: Matrix4.translationValues(0, _dragOffset, 0),
+        child: const PlayerScreen(),
       ),
     );
   }

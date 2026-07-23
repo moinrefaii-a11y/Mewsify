@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
@@ -22,12 +24,25 @@ class YouTubeSource {
   final PipedSource _piped;
 
   static final _clientFallbacks = <YoutubeApiClient>[
+    // androidVr / tv typically bypass the PO-token gate the "web" client
+    // fails on. If both fail we walk down to the mobile clients.
     YoutubeApiClient.androidVr,
     YoutubeApiClient.tv,
     YoutubeApiClient.android,
     YoutubeApiClient.ios,
     YoutubeApiClient.mediaConnect,
+    YoutubeApiClient.safari,
   ];
+
+  /// Short-lived audio URL cache keyed by videoId. YouTube signs their
+  /// media URLs with an `expire=` parameter that's typically valid for
+  /// ~6 hours, but the surrounding HTTP session tokens age faster than
+  /// that, so we cap our cache at 5 minutes and let the resolver run
+  /// again after that. Cache hits still save ~500 ms + a network call
+  /// on retry loops after a mid-track error.
+  final Map<String, _CachedUrl> _audioUrlCache = {};
+  final Map<String, _CachedUrl> _videoUrlCache = {};
+  static const _cacheTtl = Duration(minutes: 5);
 
   /// Search for tracks. Routes through our InnerTube client first;
   /// falls back to youtube_explode_dart only if YouTube Music returns
@@ -102,11 +117,20 @@ class YouTubeSource {
   }
 
   /// Resolve a fresh audio-only URL. Tries each InnerTube client in
-  /// turn until one returns a workable audio stream.
+  /// turn until one returns a workable audio stream. Result cached for
+  /// 5 minutes so retry loops after a transient failure don't spam the
+  /// resolver with duplicate network calls.
   Future<String> resolveAudioUrl(String videoId) async {
+    final cached = _audioUrlCache[videoId];
+    if (cached != null && DateTime.now().isBefore(cached.expiresAt)) {
+      return cached.url;
+    }
     final result = await _resolveStreams(videoId);
     final audio = result.audioOnly.withHighestBitrate();
-    return audio.url.toString();
+    final url = audio.url.toString();
+    _audioUrlCache[videoId] =
+        _CachedUrl(url: url, expiresAt: DateTime.now().add(_cacheTtl));
+    return url;
   }
 
   /// Resolve a fresh **video-only** stream URL (ad-free — YouTube's
@@ -121,6 +145,11 @@ class YouTubeSource {
     String videoId, {
     int preferredHeight = 720,
   }) async {
+    final cacheKey = '$videoId:$preferredHeight';
+    final cached = _videoUrlCache[cacheKey];
+    if (cached != null && DateTime.now().isBefore(cached.expiresAt)) {
+      return cached.url;
+    }
     final manifest = await _resolveStreams(videoId);
     final videoOnly = manifest.videoOnly.toList();
     if (videoOnly.isEmpty) {
@@ -156,7 +185,22 @@ class YouTubeSource {
     );
     debugPrint('[YouTubeSource] video-only ${picked.videoQuality.name} '
         '(${picked.container.name}) for $videoId');
-    return picked.url.toString();
+    final url = picked.url.toString();
+    _videoUrlCache[cacheKey] =
+        _CachedUrl(url: url, expiresAt: DateTime.now().add(_cacheTtl));
+    return url;
+  }
+
+  /// Pre-warm the audio URL cache without waiting for the caller.
+  /// Used by the Browse tab: when the user opens a /watch page we
+  /// kick off resolution immediately, so if they hit background /
+  /// hoist a second later, the URL is already ready.
+  void prewarmAudioUrl(String videoId) {
+    if (_audioUrlCache[videoId] != null &&
+        DateTime.now().isBefore(_audioUrlCache[videoId]!.expiresAt)) {
+      return;
+    }
+    unawaited(resolveAudioUrl(videoId).catchError((_) => ''));
   }
 
   /// Resolve video streams for the player. Returns one or more
@@ -404,6 +448,13 @@ class YouTubeSource {
     _yt.close();
     _piped.dispose();
   }
+}
+
+/// TTL-bounded cache entry for a resolved YouTube media URL.
+class _CachedUrl {
+  final String url;
+  final DateTime expiresAt;
+  const _CachedUrl({required this.url, required this.expiresAt});
 }
 
 /// Basic channel-level metadata for the artist header on a channel page.

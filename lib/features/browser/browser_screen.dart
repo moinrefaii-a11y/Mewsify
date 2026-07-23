@@ -41,6 +41,17 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
     return null;
   }
 
+  /// Kick off audio-URL resolution the instant the browser loads a
+  /// /watch page. The result lands in YouTubeSource's cache — if the
+  /// user backgrounds the app a second later, the shell's hoist finds
+  /// a warm cache entry and starts native playback with no gap.
+  void _prewarmIfWatchPage(WebUri? uri) {
+    if (uri == null) return;
+    final id = _extractVideoId(uri);
+    if (id == null) return;
+    ref.read(youtubeSourceProvider).prewarmAudioUrl(id);
+  }
+
   Future<void> _playCurrentInApp() async {
     final uri = _currentUri;
     if (uri == null) return;
@@ -213,12 +224,14 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
                 _currentUri = uri;
                 ref.read(browserCurrentUrlProvider.notifier).state =
                     uri?.toString();
+                _prewarmIfWatchPage(uri);
                 if (mounted) setState(() => _loading = true);
               },
               onLoadStop: (controller, uri) async {
                 _currentUri = uri;
                 ref.read(browserCurrentUrlProvider.notifier).state =
                     uri?.toString();
+                _prewarmIfWatchPage(uri);
                 _canGoBack = await controller.canGoBack();
                 await _applyAdSkipAndCleanup(controller);
                 if (mounted) setState(() => _loading = false);
@@ -227,6 +240,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen> {
                 _currentUri = uri;
                 ref.read(browserCurrentUrlProvider.notifier).state =
                     uri?.toString();
+                _prewarmIfWatchPage(uri);
               },
             ),
           ),

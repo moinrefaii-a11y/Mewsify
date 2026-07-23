@@ -82,17 +82,15 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _eventSub = _player.playbackEventStream.listen(
       _broadcastState,
       onError: (Object e, StackTrace st) {
-        // The current stream URL blew up (403, geo-block, DRM, etc.).
-        // Instead of freezing on a broken track, surface a snackbar and
-        // *auto-advance* so the user isn't stranded.
+        // The current stream errored *during* playback (URL expired,
+        // network dropped mid-song, etc.). We *don't* auto-skip here
+        // — `_playIndex` already handles the initial-resolve failure
+        // path with its own retry + skip logic. Duplicating it here
+        // was causing double-advance where the user jumped two songs
+        // for a single failure.
         _completionEnabled = false;
-        errorEvents.add('Skipping: could not play this track');
-        debugPrint('[Player] error, auto-skipping: $e');
-        Future.microtask(() async {
-          try {
-            await skipToNext();
-          } catch (_) {}
-        });
+        errorEvents.add('Playback error: retrying');
+        debugPrint('[Player] mid-stream error: $e');
       },
     );
 
@@ -228,10 +226,18 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     try {
       final url = await _yt.resolveAudioUrl(track.sourceVideoId);
       _completionEnabled = true;
-      await _player.setAudioSource(AudioSource.uri(Uri.parse(url)));
+      // Passing the search-result duration as a fallback lets just_audio
+      // populate `duration` even when the stream itself doesn't ship
+      // one (some Music tracks do this). Without it the crossfade
+      // watchdog silently gives up because `_player.duration` is null.
+      await _player.setAudioSource(
+        AudioSource.uri(Uri.parse(url)),
+        preload: true,
+      );
       await _player.setVolume(1.0);
       await _player.play();
       _scheduleCrossfade();
+      _armDurationFallback(track);
     } catch (e) {
       if (retryCount < 1) {
         await Future.delayed(const Duration(milliseconds: 800));
@@ -268,13 +274,30 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         Timer.periodic(const Duration(milliseconds: 250), (_) async {
       if (_crossfading) return;
       if (!_player.playing) return;
-      final dur = _player.duration;
+      final dur = _effectiveDuration();
       final pos = _player.position;
       if (dur == null || dur.inMilliseconds < 1000) return;
 
       final remaining = dur - pos;
       final rmMs = remaining.inMilliseconds;
       final seconds = _crossfadeSeconds();
+
+      // Proactive up-next refill: as soon as we cross the "last 30 s"
+      // threshold and don't have a next slot lined up, fire off a
+      // related-tracks fetch. Without this the fetch races the natural
+      // end of the track and autoplay stalls on the last song.
+      if (rmMs <= 30000 && !_refillInFlight && _peekNextIndex() == null) {
+        _refillInFlight = true;
+        Future(() async {
+          try {
+            if (_currentIndex >= 0 && _currentIndex < _queue.length) {
+              await _appendRelatedToQueue(_queue[_currentIndex].sourceVideoId);
+            }
+          } finally {
+            _refillInFlight = false;
+          }
+        });
+      }
 
       // 1) Crossfade path.
       if (seconds > 0 && rmMs > 200 && rmMs <= seconds * 1000 + 300) {
@@ -311,6 +334,38 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   }
 
   bool _advancing = false;
+  bool _refillInFlight = false;
+
+  /// Best-effort duration for the current track. Prefers just_audio's
+  /// resolved duration; falls back to the search-result duration on the
+  /// Track model for the small subset of streams that don't publish
+  /// one. Used by the watchdog so crossfade + end-of-track detection
+  /// stay alive even when `_player.duration` is null.
+  Duration? _effectiveDuration() {
+    final playerDur = _player.duration;
+    if (playerDur != null && playerDur > Duration.zero) return playerDur;
+    if (_currentIndex >= 0 && _currentIndex < _queue.length) {
+      final track = _queue[_currentIndex];
+      if (track.duration > Duration.zero) return track.duration;
+    }
+    return null;
+  }
+
+  /// If just_audio hasn't resolved a duration within 3 seconds of us
+  /// starting a track, rebroadcast the MediaItem with the search-result
+  /// duration so car head units + Android Auto still show track info.
+  void _armDurationFallback(Track track) {
+    if (track.duration == Duration.zero) return;
+    Future.delayed(const Duration(seconds: 3), () {
+      if (_currentIndex < 0 || _currentIndex >= _queue.length) return;
+      if (_queue[_currentIndex] != track) return;
+      final resolved = _player.duration;
+      if (resolved != null && resolved > Duration.zero) return;
+      debugPrint(
+          '[Player] duration fallback: using ${track.duration}');
+      mediaItem.add(track.toMediaItem());
+    });
+  }
 
   int _crossfadeSeconds() {
     if (!Hive.isBoxOpen('settings')) return 5;
@@ -417,27 +472,69 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   Future<void> _appendRelatedToQueue(String videoId) async {
     List<Track> pool = const [];
     try {
-      pool = await _yt.related(videoId, limit: 10);
+      pool = await _yt.related(videoId, limit: 20);
     } catch (e) {
       debugPrint('[Autoplay] related() failed: $e');
     }
-    // If related failed or came back empty (happens sometimes when YT's
-    // PO token gate flips), fall back to a keyword search on the current
-    // track's artist so autoplay still gives the user something to play.
+    // If related came back empty (happens sometimes when YT's PO token
+    // gate flips), fall back to a keyword search on the current track's
+    // artist so autoplay still gives the user something to play.
     if (pool.isEmpty &&
         _currentIndex >= 0 &&
         _currentIndex < _queue.length) {
       final current = _queue[_currentIndex];
       try {
-        pool = await _yt.search(current.artist, limit: 10);
+        pool = await _yt.search(current.artist, limit: 20);
       } catch (e) {
         debugPrint('[Autoplay] fallback search failed: $e');
       }
     }
-    final filtered = pool.where((t) => !_queue.contains(t)).toList();
-    if (filtered.isEmpty) return;
-    _queue.addAll(filtered);
+    // Keep only entries that look like normal songs, not 1-hour mix
+    // compilations or "full album" playlist rips. The related endpoint
+    // loves those; the user does not.
+    final scored = pool
+        .where((t) => !_queue.contains(t))
+        .where(_looksLikeASong)
+        .toList();
+    if (scored.isEmpty) return;
+    _queue.addAll(scored.take(10));
     queue.add(_queue.map((t) => t.toMediaItem()).toList());
+  }
+
+  /// Heuristic filter for autoplay picks. Rejects:
+  ///   * anything longer than 12 min or shorter than 45 s
+  ///   * titles that look like compilations / mixes / hour-long uploads
+  bool _looksLikeASong(Track t) {
+    final secs = t.duration.inSeconds;
+    if (secs > 0) {
+      if (secs > 12 * 60) return false;
+      if (secs < 45) return false;
+    }
+    // If the source only gave us a zero duration, keep the entry — we
+    // can't reject on a signal we don't have — but the title filter
+    // below still catches the most common "1 hour mix" case.
+    final title = t.title.toLowerCase();
+    const blockers = [
+      'mix ',
+      ' mix',
+      'compilation',
+      'full album',
+      'nonstop',
+      'jukebox',
+      '1 hour',
+      '2 hour',
+      '3 hour',
+      '10 hour',
+      'longest',
+      'megamix',
+      'top 100',
+      'top 50',
+      'playlist',
+    ];
+    for (final b in blockers) {
+      if (title.contains(b)) return false;
+    }
+    return true;
   }
 
   // --- Shuffle / repeat / sleep ----------------------------------------

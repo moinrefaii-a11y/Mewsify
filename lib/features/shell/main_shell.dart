@@ -52,11 +52,21 @@ class _MainShellState extends ConsumerState<MainShell>
   /// background" behaviour work anyway, we hoist the currently visible
   /// video into MewSify's own native audio pipeline the moment the app
   /// goes inactive.
+  /// Track the last videoId we hoisted so we don't re-fire on every
+  /// tiny lifecycle transition (Android emits inactive→paused→inactive
+  /// repeatedly on some devices).
+  String? _lastHoistedId;
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (kIsWeb) return;
-    if (state != AppLifecycleState.paused &&
-        state != AppLifecycleState.inactive) {
+    // Fire on `inactive` — a hair earlier than `paused` — so audio
+    // never gaps as the WebView loses its surface. On Android `inactive`
+    // fires ~150 ms before `paused`.
+    if (state != AppLifecycleState.inactive &&
+        state != AppLifecycleState.paused) {
+      // Coming back to the foreground: allow future hoists again.
+      if (state == AppLifecycleState.resumed) _lastHoistedId = null;
       return;
     }
     if (_index != _browseTabIndex) return;
@@ -70,20 +80,33 @@ class _MainShellState extends ConsumerState<MainShell>
     }
     final id = _extractVideoId(uri);
     if (id == null) return;
+    if (_lastHoistedId == id) return; // already hoisted this session
+    _lastHoistedId = id;
     _hoistToNative(id);
   }
 
   Future<void> _hoistToNative(String videoId) async {
-    // Only hoist if we're *not* already playing this exact track — the
-    // user might already be listening via native audio and just have
-    // the browser tab open.
     final currentTrack = ref.read(currentTrackProvider).valueOrNull;
     if (currentTrack != null && currentTrack.sourceVideoId == videoId) return;
     try {
       final yt = ref.read(youtubeSourceProvider);
+      // Kick the audio URL cache immediately (it's likely already warm
+      // from the browser's prewarm call, but harmless if not).
+      yt.prewarmAudioUrl(videoId);
       final track = await yt.getTrack(videoId);
       await ref.read(audioHandlerProvider).playWithAutoplay(track);
       await ref.read(libraryProvider).recordPlay(track);
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text('Continuing "${track.title}" in background'),
+              duration: const Duration(seconds: 3),
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+      }
     } catch (e) {
       debugPrint('[BackgroundHoist] failed: $e');
     }

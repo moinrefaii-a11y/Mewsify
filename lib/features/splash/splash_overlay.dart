@@ -3,18 +3,27 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_native_splash/flutter_native_splash.dart';
 
-/// Full-screen splash inspired by JioSaavn / Spotify launch animations.
+/// Studio-grade launch splash for MewSify.
 ///
-/// Runs 3.6s total, single AnimationController so the whole animation
-/// is coordinated by a single ticker (cheap, no rebuild-storms):
+/// A single AnimationController drives the whole timeline (2.8 s):
 ///
-///   0.00-0.60s   Logo scales from 0.7 → 1.05 (overshoot) then settles
-///                to 1.0 by 0.9s. Simultaneously fades in.
-///   0.55-1.20s  Wordmark slides up + fades in.
-///   1.10-1.80s  Tagline / credit line fades in.
-///   0.00-3.20s  Radial "pulse" behind the logo (three staggered rings
-///               expand + fade) plays throughout for that music-app feel.
-///   3.00-3.60s  Whole overlay dissolves out.
+///   0.00 - 0.30s  A muted gradient sheen sweeps across the dark
+///                 background so the screen doesn't feel dead.
+///   0.20 - 1.05s  Seven equalizer bars rise from zero, each with its
+///                 own delay + easing, forming the EQ mark. They
+///                 continue to breathe on a low-amplitude sine wave
+///                 so the icon feels alive rather than frozen.
+///   0.85 - 1.30s  The bars glide into a rounded tile and a soft green
+///                 glow pulses out from behind them (implicit — done
+///                 via the container's box-shadow spread animating).
+///   1.20 - 1.75s  Wordmark "MewSify" fades in from below with a
+///                 shimmer sweep left-to-right across the letters.
+///   1.60 - 2.10s  Tagline reveals under the wordmark.
+///   1.90 - 2.30s  "Created by MOIN" credit reveals.
+///   2.55 - 2.80s  Whole overlay fades out, revealing the app.
+///
+/// Everything is rendered inside a single RepaintBoundary + backed by
+/// one Ticker, so the whole scene is one draw call per frame.
 class SplashOverlay extends StatefulWidget {
   final Widget child;
   const SplashOverlay({super.key, required this.child});
@@ -27,45 +36,68 @@ class _SplashOverlayState extends State<SplashOverlay>
     with SingleTickerProviderStateMixin {
   late final AnimationController _c = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 3600),
+    duration: const Duration(milliseconds: 2800),
   );
 
-  // Logo scale — subtle overshoot / settle motion.
-  late final Animation<double> _logoScale = TweenSequence<double>([
+  // The bars themselves rise between 200 ms and 1050 ms.
+  late final Animation<double> _barsAppear = CurvedAnimation(
+    parent: _c,
+    curve: const Interval(0.07, 0.375, curve: Curves.easeOutCubic),
+  );
+
+  // Container "settle" — the rounded tile that houses the bars.
+  late final Animation<double> _tileScale = TweenSequence<double>([
     TweenSequenceItem(
-      tween: Tween(begin: 0.72, end: 1.06)
+      tween: Tween(begin: 0.85, end: 1.05)
           .chain(CurveTween(curve: Curves.easeOutBack)),
-      weight: 60,
+      weight: 35,
     ),
     TweenSequenceItem(
-      tween: Tween(begin: 1.06, end: 1.0)
+      tween: Tween(begin: 1.05, end: 1.0)
           .chain(CurveTween(curve: Curves.easeOutCubic)),
-      weight: 30,
+      weight: 20,
     ),
-    TweenSequenceItem(tween: ConstantTween(1.0), weight: 810),
+    TweenSequenceItem(tween: ConstantTween(1.0), weight: 45),
   ]).animate(_c);
 
-  // Fade-in intervals — CurvedAnimations, cheap to build.
-  late final Animation<double> _logoOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.0, 0.20));
+  late final Animation<double> _tileGlow = CurvedAnimation(
+    parent: _c,
+    curve: const Interval(0.30, 0.55, curve: Curves.easeOutCubic),
+  );
+
   late final Animation<double> _wordmarkOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.16, 0.34));
+      CurvedAnimation(parent: _c, curve: const Interval(0.42, 0.62));
   late final Animation<double> _wordmarkSlide = Tween<double>(
-    begin: 22,
+    begin: 24,
     end: 0,
   ).animate(CurvedAnimation(
     parent: _c,
-    curve: const Interval(0.16, 0.34, curve: Curves.easeOutCubic),
+    curve: const Interval(0.42, 0.62, curve: Curves.easeOutCubic),
   ));
+
+  late final Animation<double> _shimmerT = CurvedAnimation(
+    parent: _c,
+    curve: const Interval(0.48, 0.75, curve: Curves.easeInOut),
+  );
+
+  late final Animation<double> _taglineOpacity =
+      CurvedAnimation(parent: _c, curve: const Interval(0.58, 0.78));
   late final Animation<double> _creditOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.30, 0.52));
+      CurvedAnimation(parent: _c, curve: const Interval(0.66, 0.85));
+
   late final Animation<double> _overlayFade = Tween<double>(
     begin: 1.0,
     end: 0.0,
   ).animate(CurvedAnimation(
     parent: _c,
-    curve: const Interval(0.85, 1.0, curve: Curves.easeIn),
+    curve: const Interval(0.91, 1.0, curve: Curves.easeIn),
   ));
+
+  // Sheen sweep (subtle diagonal highlight).
+  late final Animation<double> _sheenT = CurvedAnimation(
+    parent: _c,
+    curve: const Interval(0.0, 0.28, curve: Curves.easeInOut),
+  );
 
   bool _done = false;
 
@@ -96,77 +128,76 @@ class _SplashOverlayState extends State<SplashOverlay>
           opacity: _overlayFade,
           child: IgnorePointer(
             child: RepaintBoundary(
-              child: DecoratedBox(
-                decoration: const BoxDecoration(
-                  gradient: RadialGradient(
-                    center: Alignment.center,
-                    radius: 1.3,
-                    colors: [Color(0xFF1A1F26), Color(0xFF050708)],
-                  ),
-                ),
-                child: SizedBox.expand(
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      // Continuous ring pulse behind the logo.
-                      Positioned.fill(
-                        child: CustomPaint(
-                          painter: _PulseRingPainter(_c),
+              child: AnimatedBuilder(
+                animation: _c,
+                builder: (context, _) => Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // Deep, cool-toned base.
+                    const DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: RadialGradient(
+                          center: Alignment.center,
+                          radius: 1.4,
+                          colors: [
+                            Color(0xFF12181D),
+                            Color(0xFF040608),
+                          ],
                         ),
                       ),
-                      Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
+                    ),
+                    // Diagonal sheen sweep.
+                    _Sheen(t: _sheenT.value),
+                    // Main content column.
+                    Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
-                          const Spacer(flex: 4),
-                          FadeTransition(
-                            opacity: _logoOpacity,
-                            child: ScaleTransition(
-                              scale: _logoScale,
-                              child: const _StaticLogo(),
+                          Transform.scale(
+                            scale: _tileScale.value,
+                            child: _LogoTile(
+                              barsProgress: _barsAppear.value,
+                              settle: _c.value,
+                              glow: _tileGlow.value,
                             ),
                           ),
-                          const SizedBox(height: 26),
-                          AnimatedBuilder(
-                            animation: _c,
-                            builder: (_, __) => Opacity(
-                              opacity: _wordmarkOpacity.value,
-                              child: Transform.translate(
-                                offset: Offset(0, _wordmarkSlide.value),
-                                child: const Text(
-                                  'MewSify',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 34,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: -0.6,
-                                  ),
-                                ),
-                              ),
+                          const SizedBox(height: 34),
+                          Opacity(
+                            opacity: _wordmarkOpacity.value,
+                            child: Transform.translate(
+                              offset: Offset(0, _wordmarkSlide.value),
+                              child: _Wordmark(shimmer: _shimmerT.value),
                             ),
                           ),
                           const SizedBox(height: 10),
-                          FadeTransition(
-                            opacity: _creditOpacity,
+                          Opacity(
+                            opacity: _taglineOpacity.value,
                             child: const Text(
-                              'YOUR MUSIC, YOUR VIBE',
+                              'YOUR MUSIC   ·   YOUR VIBE',
                               style: TextStyle(
-                                color: Colors.white38,
+                                color: Color(0x88FFFFFF),
                                 fontSize: 11,
                                 fontWeight: FontWeight.w700,
-                                letterSpacing: 3.2,
+                                letterSpacing: 3.6,
                               ),
                             ),
                           ),
-                          const Spacer(flex: 6),
-                          FadeTransition(
-                            opacity: _creditOpacity,
-                            child: const _Credit(),
-                          ),
-                          const SizedBox(height: 44),
                         ],
                       ),
-                    ],
-                  ),
+                    ),
+                    // "Created by MOIN" pinned near the bottom.
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 52,
+                      child: Center(
+                        child: Opacity(
+                          opacity: _creditOpacity.value,
+                          child: const _Credit(),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -177,78 +208,62 @@ class _SplashOverlayState extends State<SplashOverlay>
   }
 }
 
-/// Three staggered rings expanding outward from the logo, at low
-/// opacity. Painted every frame the controller ticks — no rebuild
-/// storms because the whole overlay is inside a `RepaintBoundary`.
-class _PulseRingPainter extends CustomPainter {
-  final Animation<double> t;
-  _PulseRingPainter(this.t) : super(repaint: t);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final center = size.center(Offset.zero);
-    // Only paint while the intro is in its "attention" phase — after
-    // 85% of the controller runtime we're fading out and the rings
-    // would just add visual noise.
-    if (t.value > 0.85) return;
-    for (var i = 0; i < 3; i++) {
-      // Stagger each ring's phase by 1/3 of the loop.
-      final phase = (t.value * 3 + i / 3) % 1.0;
-      // Ease out so ring speed matches Spotify-style pulse.
-      final eased = Curves.easeOut.transform(phase);
-      final radius = 60 + eased * 220;
-      final opacity = (1.0 - phase) * 0.25;
-      final paint = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.6
-        ..color = const Color(0xFF1DE97C).withValues(alpha: opacity);
-      canvas.drawCircle(center, radius, paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _PulseRingPainter old) => old.t != t;
-}
-
-/// Static logo (never repaints). Green-teal gradient tile with 7
-/// equalizer bars painted once.
-class _StaticLogo extends StatelessWidget {
-  const _StaticLogo();
+/// The gradient logo tile with the equalizer bars painted inside.
+/// The bars themselves are painted by [_EqBarsPainter] which factors
+/// in both a rise-in animation ([barsProgress]) and a low-amplitude
+/// breathing motion driven by the parent controller's raw [settle].
+class _LogoTile extends StatelessWidget {
+  final double barsProgress; // 0..1 rise-in
+  final double settle; // 0..1 overall controller value (for breathing)
+  final double glow; // 0..1 halo intensity
+  const _LogoTile({
+    required this.barsProgress,
+    required this.settle,
+    required this.glow,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 118,
-      height: 118,
+      width: 128,
+      height: 128,
       decoration: BoxDecoration(
         gradient: const LinearGradient(
           colors: [Color(0xFF1DE97C), Color(0xFF0AA0AF)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: BorderRadius.circular(28),
-        boxShadow: const [
+        borderRadius: BorderRadius.circular(30),
+        boxShadow: [
           BoxShadow(
-            color: Color(0x551DE97C),
-            blurRadius: 48,
-            spreadRadius: -2,
-            offset: Offset(0, 18),
+            color: const Color(0xFF1DE97C).withValues(alpha: 0.15 + glow * 0.35),
+            blurRadius: 30 + glow * 40,
+            spreadRadius: -6 + glow * 6,
+            offset: const Offset(0, 14),
           ),
         ],
       ),
-      child: const Center(
+      child: Center(
         child: CustomPaint(
-          size: Size(68, 68),
-          painter: _BarsPainter(),
+          size: const Size(72, 72),
+          painter: _EqBarsPainter(
+            appear: barsProgress,
+            settle: settle,
+          ),
         ),
       ),
     );
   }
 }
 
-class _BarsPainter extends CustomPainter {
-  const _BarsPainter();
-  static const _heights = [0.40, 0.65, 0.90, 1.0, 0.90, 0.65, 0.40];
+/// Seven bars that rise from zero, each with its own stagger, and
+/// after they've settled continue to gently breathe on a sine wave.
+class _EqBarsPainter extends CustomPainter {
+  final double appear; // 0..1
+  final double settle; // 0..1 (raw controller value)
+  _EqBarsPainter({required this.appear, required this.settle});
+
+  static const _target = [0.42, 0.62, 0.86, 1.0, 0.86, 0.62, 0.42];
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -256,8 +271,19 @@ class _BarsPainter extends CustomPainter {
     const barCount = 7;
     final barWidth = size.width / (barCount * 2 - 1);
     final gap = barWidth;
+
     for (var i = 0; i < barCount; i++) {
-      final h = _heights[i] * size.height;
+      // Stagger: earlier bars rise first.
+      final localT =
+          ((appear - i * 0.05) / 0.6).clamp(0.0, 1.0);
+      final eased = Curves.easeOutBack.transform(localT);
+      // Once appear is done, add a breathing wobble.
+      final breatheAmp = appear >= 1.0 ? 0.05 : 0.0;
+      final breathe = math.sin(
+              (settle * 2 * math.pi * 1.4) + (i * 0.55)) *
+          breatheAmp;
+      final targetH = _target[i] + breathe;
+      final h = (targetH * eased).clamp(0.0, 1.0) * size.height;
       final x = i * (barWidth + gap);
       final y = (size.height - h) / 2;
       canvas.drawRRect(
@@ -271,7 +297,84 @@ class _BarsPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter old) => false;
+  bool shouldRepaint(covariant _EqBarsPainter old) =>
+      old.appear != appear || old.settle != settle;
+}
+
+/// Diagonal gradient sheen that sweeps across the whole screen while
+/// the logo assembles.
+class _Sheen extends StatelessWidget {
+  final double t; // 0..1
+  const _Sheen({required this.t});
+
+  @override
+  Widget build(BuildContext context) {
+    if (t <= 0 || t >= 1) return const SizedBox.shrink();
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: FractionalTranslation(
+          translation: Offset(-1.0 + 2.0 * t, -0.4 + 0.8 * t),
+          child: Container(
+            width: 400,
+            height: 800,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Colors.transparent,
+                  const Color(0x11FFFFFF).withValues(alpha: 0.08),
+                  Colors.transparent,
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// "MewSify" wordmark with a shimmer highlight sweeping across the
+/// letters as it fades in.
+class _Wordmark extends StatelessWidget {
+  final double shimmer; // 0..1
+  const _Wordmark({required this.shimmer});
+
+  @override
+  Widget build(BuildContext context) {
+    return ShaderMask(
+      blendMode: BlendMode.srcATop,
+      shaderCallback: (rect) {
+        // A soft white streak that travels left→right across the text.
+        final phase = (shimmer * 1.6) - 0.3;
+        return LinearGradient(
+          begin: Alignment.centerLeft,
+          end: Alignment.centerRight,
+          stops: [
+            (phase - 0.2).clamp(0.0, 1.0),
+            phase.clamp(0.0, 1.0),
+            (phase + 0.2).clamp(0.0, 1.0),
+          ],
+          colors: const [
+            Color(0xFFFFFFFF),
+            Color(0xFFCFEEDA),
+            Color(0xFFFFFFFF),
+          ],
+        ).createShader(rect);
+      },
+      child: const Text(
+        'MewSify',
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: 40,
+          fontWeight: FontWeight.w900,
+          letterSpacing: -1.0,
+          height: 1.0,
+        ),
+      ),
+    );
+  }
 }
 
 class _Credit extends StatelessWidget {
@@ -280,23 +383,23 @@ class _Credit extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return const Row(
-      mainAxisAlignment: MainAxisAlignment.center,
+      mainAxisSize: MainAxisSize.min,
       children: [
         Text(
           'Created with ',
           style: TextStyle(
             color: Colors.white54,
-            fontSize: 13,
+            fontSize: 12,
             fontWeight: FontWeight.w400,
             letterSpacing: 0.3,
           ),
         ),
-        Text('❤️', style: TextStyle(fontSize: 14)),
+        Text('❤️', style: TextStyle(fontSize: 13)),
         Text(
           ' by ',
           style: TextStyle(
             color: Colors.white54,
-            fontSize: 13,
+            fontSize: 12,
             fontWeight: FontWeight.w400,
             letterSpacing: 0.3,
           ),
@@ -305,16 +408,12 @@ class _Credit extends StatelessWidget {
           'MOIN',
           style: TextStyle(
             color: Colors.white,
-            fontSize: 14,
+            fontSize: 13,
             fontWeight: FontWeight.w800,
-            letterSpacing: 2.0,
+            letterSpacing: 2.4,
           ),
         ),
       ],
     );
   }
 }
-
-// Kept only for import compatibility if any older file references it.
-// ignore: unused_element
-const _kUnusedMath = math.pi;
