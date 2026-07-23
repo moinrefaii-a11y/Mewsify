@@ -68,7 +68,22 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     // Restore the last queue from disk so reopening the app continues
     // where the user left off (paused at the last track + position).
     _restoreQueue();
+
+    // Watchdog health check: every 2 s, verify the crossfade watchdog
+    // is still armed while the player is playing. If it isn't, re-arm
+    // it. Cheap safety net against edge cases where a code path skips
+    // calling `_scheduleCrossfade()` after a track change.
+    _healthCheck?.cancel();
+    _healthCheck = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_player.playing &&
+          (_crossfadeWatchdog == null || !_crossfadeWatchdog!.isActive)) {
+        debugPrint('[Health] watchdog missing while playing — re-arming');
+        _scheduleCrossfade();
+      }
+    });
   }
+
+  Timer? _healthCheck;
 
   /// Listens to the *currently active* player. Called once at startup
   /// and every time we promote the inactive player after a crossfade.
@@ -314,6 +329,16 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       await _player.play();
       _scheduleCrossfade();
       _armDurationFallback(track);
+      // Proactively top up the up-next queue after every track change.
+      // Waiting until "last 30 s" was too late for many songs: if that
+      // fetch failed there was no time to retry before the track ended
+      // and autoplay silently died.
+      if (_peekNextIndex() == null && !_refillInFlight) {
+        _refillInFlight = true;
+        unawaited(_appendRelatedToQueue(track.sourceVideoId).whenComplete(() {
+          _refillInFlight = false;
+        }));
+      }
     } catch (e) {
       if (retryCount < 1) {
         await Future.delayed(const Duration(milliseconds: 800));
@@ -360,26 +385,46 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
 
       final pos = _player.position;
 
-      // ---- 1) Stall detection (duration-independent) ----------------
-      // MUST run before any duration-dependent early-return. YouTube
-      // Music tracks often don't publish a stream duration, which
-      // previously blocked the watchdog from ever reaching the stall
-      // check. Result: audio would freeze silently mid-song, UI still
-      // showed "playing", and nothing would auto-advance.
+      // ---- 1) End-of-track / stall detection (duration-independent).
+      // Must run before any duration-dependent early-return. If the
+      // player claims to be playing but position hasn't moved in ~2 s
+      // we either hit a stalled stream OR the stream ended without
+      // just_audio emitting a `completed` event (common on YouTube
+      // audio streams).
       if (_lastKnownPosMs == pos.inMilliseconds) {
         _stallTicks++;
-        // 3 s of no forward progress while the player claims to be
-        // playing = stalled. Skip aggressively so the user isn't
-        // staring at a silent "playing" state.
-        if (_stallTicks >= 12 && !_advancing) {
+        if (_stallTicks >= 8 && !_advancing) {
           _advancing = true;
           _stallTicks = 0;
-          debugPrint('[Watchdog] stall detected at ${pos.inSeconds}s — skipping');
-          errorEvents.add('Playback stalled — skipping');
+          final dur = _effectiveDuration();
+          final atEnd = dur != null
+              ? pos.inMilliseconds >= dur.inMilliseconds - 3000
+              : pos.inSeconds > 45;
+          final next = _peekNextIndex();
+          final seconds = _crossfadeSeconds();
+          // If we're at a natural end + crossfade is enabled + we have
+          // a next track ready → run the crossfade instead of a hard
+          // cut skip. This is what the user is asking for: songs
+          // that flow into each other rather than gap-then-jump.
+          if (atEnd && seconds > 0 && next != null) {
+            debugPrint(
+                '[Watchdog] end-of-track crossfade to $next');
+            _advancing = false; // crossfade owns advancing state
+            await _startCrossfade(
+              toIndex: next,
+              durationSeconds: seconds.clamp(2, 6),
+            );
+            return;
+          }
+          if (atEnd) {
+            debugPrint(
+                '[Watchdog] natural end at ${pos.inSeconds}s — silent skip');
+          } else {
+            debugPrint(
+                '[Watchdog] mid-song stall at ${pos.inSeconds}s — skip + notify');
+            errorEvents.add('Skipping — connection issue on this track');
+          }
           try {
-            // Pause first so the UI reflects the transition instead of
-            // continuing to show a "playing" state during the resolve
-            // for the next track.
             await _player.pause();
           } catch (_) {}
           try {
@@ -785,13 +830,28 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
   @override
   Future<void> skipToNext() async {
     var next = _peekNextIndex();
-    // If the user just kicked off playWithAutoplay, the related-tracks
-    // background fetch may not have completed yet. When that happens
-    // we eagerly fill the queue here so the lock-screen Next button
-    // never becomes a no-op.
+    // Aggressive queue-refill fallback chain so autoplay never stalls
+    // silently on "no next track". Try related first, then a text
+    // search on the current track's title, then on artist alone.
     if (next == null && _queue.isNotEmpty) {
       await _appendRelatedToQueue(_queue.last.sourceVideoId);
       next = _peekNextIndex();
+    }
+    if (next == null && _queue.isNotEmpty) {
+      final current = _queue.last;
+      try {
+        final pool = await _yt.search(current.title, limit: 15);
+        final filtered = pool
+            .where((t) => !_queue.contains(t))
+            .where(_reasonableDuration)
+            .take(5)
+            .toList();
+        if (filtered.isNotEmpty) {
+          _queue.addAll(filtered);
+          queue.add(_queue.map((t) => t.toMediaItem()).toList());
+          next = _peekNextIndex();
+        }
+      } catch (_) {}
     }
     if (next != null) await _playIndex(next);
   }

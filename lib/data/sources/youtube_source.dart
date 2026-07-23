@@ -315,27 +315,25 @@ class YouTubeSource {
     return related.take(limit).map(_videoToTrack).toList();
   }
 
-  /// Real YouTube channel uploads — matches what you see on the channel's
-  /// "Videos" tab (title, upload date, view count). Returns Tracks with
-  /// the `album` field populated with "X ago · Y views" so the UI can
-  /// display that YouTube-style subtitle without a new model field.
+  /// Real YouTube channel uploads — matches what you see on the
+  /// channel's "Videos" tab. Uses our own InnerTube browse call
+  /// because youtube_explode_dart 3.1.0's channels.getUploads returns
+  /// zero entries and getUploadsFromPage returns entries with empty
+  /// titles (YouTube changed the response shape; the library hasn't
+  /// caught up). If InnerTube also fails we fall back to a keyword
+  /// search on the channel name so the page is never empty.
   Future<List<Track>> channelUploads(
     String channelId, {
     int limit = 30,
   }) async {
+    final direct = await _piped.channelUploads(channelId, limit: limit);
+    if (direct.isNotEmpty) return direct;
+    debugPrint('[YouTubeSource] channelUploads direct empty, falling back');
     try {
-      final uploads =
-          await _yt.channels.getUploads(channelId).take(limit).toList();
-      return uploads.map(_videoToChannelTrack).toList();
-    } catch (e) {
-      debugPrint('[YouTubeSource] channelUploads failed: $e');
-      // Best-effort fallback: search for the channel's name.
-      try {
-        final channel = await _yt.channels.get(channelId);
-        return search(channel.title, limit: limit);
-      } catch (_) {
-        return const [];
-      }
+      final channel = await _yt.channels.get(channelId);
+      return search(channel.title, limit: limit);
+    } catch (_) {
+      return const [];
     }
   }
 
