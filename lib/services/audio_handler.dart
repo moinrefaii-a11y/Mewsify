@@ -82,15 +82,22 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
     _eventSub = _player.playbackEventStream.listen(
       _broadcastState,
       onError: (Object e, StackTrace st) {
-        // The current stream errored *during* playback (URL expired,
-        // network dropped mid-song, etc.). We *don't* auto-skip here
-        // — `_playIndex` already handles the initial-resolve failure
-        // path with its own retry + skip logic. Duplicating it here
-        // was causing double-advance where the user jumped two songs
-        // for a single failure.
-        _completionEnabled = false;
-        errorEvents.add('Playback error: retrying');
+        // Mid-stream error (URL expired mid-play, network dropped, DRM).
+        // Guard the auto-skip with `_advancing` so we don't stack up on
+        // the resolve path's own retry logic — one failure, one skip.
         debugPrint('[Player] mid-stream error: $e');
+        if (_advancing) return;
+        _advancing = true;
+        _completionEnabled = false;
+        errorEvents.add('Playback error — skipping');
+        Future.microtask(() async {
+          try {
+            await skipToNext();
+          } catch (_) {}
+          Future.delayed(const Duration(seconds: 1), () {
+            _advancing = false;
+          });
+        });
       },
     );
 
@@ -323,15 +330,42 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         try {
           await _onTrackCompleted();
         } finally {
-          // Reset after a short cooldown so the next track can be
-          // completion-detected too.
           Future.delayed(const Duration(seconds: 1), () {
             _advancing = false;
           });
         }
+        return;
+      }
+
+      // 3) Position-stall fallback. If the player claims to be playing
+      // but the position hasn't advanced in 5 s, treat as stuck and
+      // advance. YouTube throttles some streams so aggressively that
+      // playback hangs mid-song without an error event.
+      if (_lastKnownPosMs == pos.inMilliseconds) {
+        _stallTicks++;
+        if (_stallTicks >= 20 && !_advancing) {
+          // 20 * 250 ms = 5 s of no forward progress while playing.
+          _advancing = true;
+          _stallTicks = 0;
+          debugPrint('[Watchdog] position stall detected — skipping');
+          errorEvents.add('Playback stalled — skipping');
+          try {
+            await skipToNext();
+          } finally {
+            Future.delayed(const Duration(seconds: 1), () {
+              _advancing = false;
+            });
+          }
+        }
+      } else {
+        _lastKnownPosMs = pos.inMilliseconds;
+        _stallTicks = 0;
       }
     });
   }
+
+  int _lastKnownPosMs = 0;
+  int _stallTicks = 0;
 
   bool _advancing = false;
   bool _refillInFlight = false;
@@ -489,34 +523,35 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
         debugPrint('[Autoplay] fallback search failed: $e');
       }
     }
-    // Keep only entries that look like normal songs, not 1-hour mix
-    // compilations or "full album" playlist rips. The related endpoint
-    // loves those; the user does not.
-    final scored = pool
-        .where((t) => !_queue.contains(t))
-        .where(_looksLikeASong)
-        .toList();
-    if (scored.isEmpty) return;
-    _queue.addAll(scored.take(10));
+    // Filter with a graceful fallback: try aggressive first, then just
+    // duration, and finally the unfiltered pool. Bad filter output is
+    // way worse than "some autoplay picks are compilations" — a filter
+    // that rejects everything and stalls playback is the worst outcome.
+    final notInQueue = pool.where((t) => !_queue.contains(t)).toList();
+    var picks = notInQueue.where(_looksLikeASong).toList();
+    if (picks.isEmpty) {
+      // Just duration filter — drops multi-hour mixes but keeps
+      // legitimate long titles like "Song Name (Extended Mix)".
+      picks = notInQueue.where(_reasonableDuration).toList();
+    }
+    if (picks.isEmpty) picks = notInQueue; // last resort
+    if (picks.isEmpty) return;
+    debugPrint('[Autoplay] appending ${picks.take(10).length} related tracks');
+    _queue.addAll(picks.take(10));
     queue.add(_queue.map((t) => t.toMediaItem()).toList());
   }
 
-  /// Heuristic filter for autoplay picks. Rejects:
-  ///   * anything longer than 12 min or shorter than 45 s
-  ///   * titles that look like compilations / mixes / hour-long uploads
+  /// Heuristic filter for autoplay picks. First-pass filter that
+  /// rejects on both duration + title. If it kills the entire pool we
+  /// fall back to just duration, so autoplay never fully stalls on
+  /// filter output.
   bool _looksLikeASong(Track t) {
-    final secs = t.duration.inSeconds;
-    if (secs > 0) {
-      if (secs > 12 * 60) return false;
-      if (secs < 45) return false;
-    }
-    // If the source only gave us a zero duration, keep the entry — we
-    // can't reject on a signal we don't have — but the title filter
-    // below still catches the most common "1 hour mix" case.
+    if (!_reasonableDuration(t)) return false;
     final title = t.title.toLowerCase();
+    // Only reject titles with *strong* signals of a compilation /
+    // long-form upload. Generic words like "mix" alone are too
+    // common in legit remix titles ("Extended Mix", "Radio Mix").
     const blockers = [
-      'mix ',
-      ' mix',
       'compilation',
       'full album',
       'nonstop',
@@ -525,15 +560,28 @@ class MelodyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler
       '2 hour',
       '3 hour',
       '10 hour',
-      'longest',
       'megamix',
       'top 100',
       'top 50',
       'playlist',
+      'lo-fi mix',
+      'chill mix',
+      'workout mix',
     ];
     for (final b in blockers) {
       if (title.contains(b)) return false;
     }
+    return true;
+  }
+
+  /// Loose duration filter (45 s – 15 min). Kept separate so it can be
+  /// used as a fallback when the strict `_looksLikeASong` filter would
+  /// have rejected everything.
+  bool _reasonableDuration(Track t) {
+    final secs = t.duration.inSeconds;
+    if (secs == 0) return true; // unknown → give it the benefit of the doubt
+    if (secs > 15 * 60) return false;
+    if (secs < 45) return false;
     return true;
   }
 

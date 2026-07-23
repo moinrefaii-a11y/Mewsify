@@ -5,25 +5,23 @@ import 'package:flutter_native_splash/flutter_native_splash.dart';
 
 /// Studio-grade launch splash for MewSify.
 ///
-/// A single AnimationController drives the whole timeline (2.8 s):
+/// 3.2 s of coordinated motion driven by ONE AnimationController:
 ///
-///   0.00 - 0.30s  A muted gradient sheen sweeps across the dark
-///                 background so the screen doesn't feel dead.
-///   0.20 - 1.05s  Seven equalizer bars rise from zero, each with its
-///                 own delay + easing, forming the EQ mark. They
-///                 continue to breathe on a low-amplitude sine wave
-///                 so the icon feels alive rather than frozen.
-///   0.85 - 1.30s  The bars glide into a rounded tile and a soft green
-///                 glow pulses out from behind them (implicit — done
-///                 via the container's box-shadow spread animating).
-///   1.20 - 1.75s  Wordmark "MewSify" fades in from below with a
-///                 shimmer sweep left-to-right across the letters.
-///   1.60 - 2.10s  Tagline reveals under the wordmark.
-///   1.90 - 2.30s  "Created by MOIN" credit reveals.
-///   2.55 - 2.80s  Whole overlay fades out, revealing the app.
+///   0.00 – 0.30s   Radial vignette + diagonal sheen sweep across bg.
+///   0.15 – 1.00s   Seven equalizer bars rise into the gradient tile,
+///                  each with its own stagger + overshoot easing.
+///   0.85 – 1.30s   Tile scales in and a soft green glow blooms.
+///   1.05 – 2.60s   Three concentric ripple rings pulse outward from
+///                  the tile — the "sound-wave" motion that reads as
+///                  "music", not a generic app splash.
+///   1.20 – 1.90s   "MewSify" wordmark reveals **one letter at a time**
+///                  with a soft slide-up + fade per letter.
+///   1.80 – 2.20s   Tagline fades in.
+///   2.05 – 2.45s   "Created with ❤ by MOIN" credit fades in.
+///   2.90 – 3.20s   Whole overlay dissolves out.
 ///
-/// Everything is rendered inside a single RepaintBoundary + backed by
-/// one Ticker, so the whole scene is one draw call per frame.
+/// Everything renders inside a single RepaintBoundary + one Ticker —
+/// one paint call per frame regardless of complexity.
 class SplashOverlay extends StatefulWidget {
   final Widget child;
   const SplashOverlay({super.key, required this.child});
@@ -36,24 +34,24 @@ class _SplashOverlayState extends State<SplashOverlay>
     with SingleTickerProviderStateMixin {
   late final AnimationController _c = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 2800),
+    duration: const Duration(milliseconds: 3200),
   );
 
-  // The bars themselves rise between 200 ms and 1050 ms.
+  // Bars rise 0.15-1.00s (relative: 0.047-0.313)
   late final Animation<double> _barsAppear = CurvedAnimation(
     parent: _c,
-    curve: const Interval(0.07, 0.375, curve: Curves.easeOutCubic),
+    curve: const Interval(0.047, 0.313, curve: Curves.easeOutCubic),
   );
 
-  // Container "settle" — the rounded tile that houses the bars.
+  // Tile scale + overshoot 0.85-1.30s (0.266-0.406)
   late final Animation<double> _tileScale = TweenSequence<double>([
     TweenSequenceItem(
-      tween: Tween(begin: 0.85, end: 1.05)
+      tween: Tween(begin: 0.82, end: 1.06)
           .chain(CurveTween(curve: Curves.easeOutBack)),
       weight: 35,
     ),
     TweenSequenceItem(
-      tween: Tween(begin: 1.05, end: 1.0)
+      tween: Tween(begin: 1.06, end: 1.0)
           .chain(CurveTween(curve: Curves.easeOutCubic)),
       weight: 20,
     ),
@@ -65,35 +63,32 @@ class _SplashOverlayState extends State<SplashOverlay>
     curve: const Interval(0.30, 0.55, curve: Curves.easeOutCubic),
   );
 
-  late final Animation<double> _wordmarkOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.42, 0.62));
-  late final Animation<double> _wordmarkSlide = Tween<double>(
-    begin: 24,
-    end: 0,
-  ).animate(CurvedAnimation(
+  // Ripples run 1.05-2.60s (0.328-0.813) — plenty of time for three
+  // staggered rings to complete their outward pulse.
+  late final Animation<double> _ripplePhase = CurvedAnimation(
     parent: _c,
-    curve: const Interval(0.42, 0.62, curve: Curves.easeOutCubic),
-  ));
+    curve: const Interval(0.328, 0.813),
+  );
 
-  late final Animation<double> _shimmerT = CurvedAnimation(
+  // Wordmark letters 1.20-1.90s (0.375-0.594)
+  late final Animation<double> _wordmarkPhase = CurvedAnimation(
     parent: _c,
-    curve: const Interval(0.48, 0.75, curve: Curves.easeInOut),
+    curve: const Interval(0.375, 0.594),
   );
 
   late final Animation<double> _taglineOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.58, 0.78));
+      CurvedAnimation(parent: _c, curve: const Interval(0.563, 0.688));
   late final Animation<double> _creditOpacity =
-      CurvedAnimation(parent: _c, curve: const Interval(0.66, 0.85));
+      CurvedAnimation(parent: _c, curve: const Interval(0.641, 0.766));
 
   late final Animation<double> _overlayFade = Tween<double>(
     begin: 1.0,
     end: 0.0,
   ).animate(CurvedAnimation(
     parent: _c,
-    curve: const Interval(0.91, 1.0, curve: Curves.easeIn),
+    curve: const Interval(0.906, 1.0, curve: Curves.easeIn),
   ));
 
-  // Sheen sweep (subtle diagonal highlight).
   late final Animation<double> _sheenT = CurvedAnimation(
     parent: _c,
     curve: const Interval(0.0, 0.28, curve: Curves.easeInOut),
@@ -133,7 +128,6 @@ class _SplashOverlayState extends State<SplashOverlay>
                 builder: (context, _) => Stack(
                   fit: StackFit.expand,
                   children: [
-                    // Deep, cool-toned base.
                     const DecoratedBox(
                       decoration: BoxDecoration(
                         gradient: RadialGradient(
@@ -146,30 +140,41 @@ class _SplashOverlayState extends State<SplashOverlay>
                         ),
                       ),
                     ),
-                    // Diagonal sheen sweep.
                     _Sheen(t: _sheenT.value),
-                    // Main content column.
                     Center(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Transform.scale(
-                            scale: _tileScale.value,
-                            child: _LogoTile(
-                              barsProgress: _barsAppear.value,
-                              settle: _c.value,
-                              glow: _tileGlow.value,
+                          SizedBox(
+                            width: 320,
+                            height: 320,
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                // Concentric sound-wave ripples behind
+                                // the logo — the "musical" touch.
+                                CustomPaint(
+                                  size: const Size(320, 320),
+                                  painter: _RipplePainter(
+                                    phase: _ripplePhase.value,
+                                  ),
+                                ),
+                                // Gradient tile with rising bars inside.
+                                Transform.scale(
+                                  scale: _tileScale.value,
+                                  child: _LogoTile(
+                                    barsProgress: _barsAppear.value,
+                                    settle: _c.value,
+                                    glow: _tileGlow.value,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 34),
-                          Opacity(
-                            opacity: _wordmarkOpacity.value,
-                            child: Transform.translate(
-                              offset: Offset(0, _wordmarkSlide.value),
-                              child: _Wordmark(shimmer: _shimmerT.value),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
+                          const SizedBox(height: 22),
+                          // Letter-by-letter wordmark reveal.
+                          _StaggeredWordmark(phase: _wordmarkPhase.value),
+                          const SizedBox(height: 12),
                           Opacity(
                             opacity: _taglineOpacity.value,
                             child: const Text(
@@ -185,7 +190,6 @@ class _SplashOverlayState extends State<SplashOverlay>
                         ],
                       ),
                     ),
-                    // "Created by MOIN" pinned near the bottom.
                     Positioned(
                       left: 0,
                       right: 0,
@@ -209,13 +213,10 @@ class _SplashOverlayState extends State<SplashOverlay>
 }
 
 /// The gradient logo tile with the equalizer bars painted inside.
-/// The bars themselves are painted by [_EqBarsPainter] which factors
-/// in both a rise-in animation ([barsProgress]) and a low-amplitude
-/// breathing motion driven by the parent controller's raw [settle].
 class _LogoTile extends StatelessWidget {
-  final double barsProgress; // 0..1 rise-in
-  final double settle; // 0..1 overall controller value (for breathing)
-  final double glow; // 0..1 halo intensity
+  final double barsProgress;
+  final double settle;
+  final double glow;
   const _LogoTile({
     required this.barsProgress,
     required this.settle,
@@ -225,27 +226,27 @@ class _LogoTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 128,
-      height: 128,
+      width: 132,
+      height: 132,
       decoration: BoxDecoration(
         gradient: const LinearGradient(
           colors: [Color(0xFF1DE97C), Color(0xFF0AA0AF)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: BorderRadius.circular(30),
+        borderRadius: BorderRadius.circular(32),
         boxShadow: [
           BoxShadow(
-            color: const Color(0xFF1DE97C).withValues(alpha: 0.15 + glow * 0.35),
-            blurRadius: 30 + glow * 40,
-            spreadRadius: -6 + glow * 6,
-            offset: const Offset(0, 14),
+            color: const Color(0xFF1DE97C).withValues(alpha: 0.18 + glow * 0.42),
+            blurRadius: 32 + glow * 48,
+            spreadRadius: -6 + glow * 8,
+            offset: const Offset(0, 16),
           ),
         ],
       ),
       child: Center(
         child: CustomPaint(
-          size: const Size(72, 72),
+          size: const Size(74, 74),
           painter: _EqBarsPainter(
             appear: barsProgress,
             settle: settle,
@@ -256,11 +257,9 @@ class _LogoTile extends StatelessWidget {
   }
 }
 
-/// Seven bars that rise from zero, each with its own stagger, and
-/// after they've settled continue to gently breathe on a sine wave.
 class _EqBarsPainter extends CustomPainter {
-  final double appear; // 0..1
-  final double settle; // 0..1 (raw controller value)
+  final double appear;
+  final double settle;
   _EqBarsPainter({required this.appear, required this.settle});
 
   static const _target = [0.42, 0.62, 0.86, 1.0, 0.86, 0.62, 0.42];
@@ -273,12 +272,9 @@ class _EqBarsPainter extends CustomPainter {
     final gap = barWidth;
 
     for (var i = 0; i < barCount; i++) {
-      // Stagger: earlier bars rise first.
-      final localT =
-          ((appear - i * 0.05) / 0.6).clamp(0.0, 1.0);
+      final localT = ((appear - i * 0.05) / 0.6).clamp(0.0, 1.0);
       final eased = Curves.easeOutBack.transform(localT);
-      // Once appear is done, add a breathing wobble.
-      final breatheAmp = appear >= 1.0 ? 0.05 : 0.0;
+      final breatheAmp = appear >= 1.0 ? 0.06 : 0.0;
       final breathe = math.sin(
               (settle * 2 * math.pi * 1.4) + (i * 0.55)) *
           breatheAmp;
@@ -301,10 +297,83 @@ class _EqBarsPainter extends CustomPainter {
       old.appear != appear || old.settle != settle;
 }
 
-/// Diagonal gradient sheen that sweeps across the whole screen while
-/// the logo assembles.
+/// Three concentric rings that pulse outward from the tile — the
+/// classic "sound-wave" motif. Staggered so at any moment there's a
+/// visible ring somewhere in the sequence. Fades to zero opacity as
+/// each ring expands.
+class _RipplePainter extends CustomPainter {
+  final double phase; // 0..1
+  _RipplePainter({required this.phase});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (phase <= 0.0) return;
+    final center = size.center(Offset.zero);
+    for (var i = 0; i < 3; i++) {
+      // Each ring's own 0..1 progression, staggered by 1/3 of a cycle.
+      var t = (phase * 3 + i / 3) % 1.0;
+      // Only show the ring during its "outward" half.
+      if (t < 0.05) continue;
+      final eased = Curves.easeOutCubic.transform(t);
+      final radius = 70 + eased * 90;
+      final opacity = (1.0 - t) * 0.35;
+      final stroke = 2.4 - (t * 1.6);
+      final paint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = stroke.clamp(0.4, 2.4)
+        ..color = const Color(0xFF1DE97C).withValues(alpha: opacity);
+      canvas.drawCircle(center, radius, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _RipplePainter old) => old.phase != phase;
+}
+
+/// "MewSify" wordmark that reveals letter-by-letter. Each letter has
+/// its own 60 ms stagger and slides up + fades in.
+class _StaggeredWordmark extends StatelessWidget {
+  final double phase; // 0..1 across the whole word
+  const _StaggeredWordmark({required this.phase});
+
+  static const _text = 'MewSify';
+
+  @override
+  Widget build(BuildContext context) {
+    final chars = <Widget>[];
+    for (var i = 0; i < _text.length; i++) {
+      // Distribute each letter's window inside phase [0..1] with 60%
+      // overlap so the reveal feels continuous, not choppy.
+      final start = i / (_text.length + 2);
+      final end = (i + 2) / (_text.length + 2);
+      final t = ((phase - start) / (end - start)).clamp(0.0, 1.0);
+      final eased = Curves.easeOutCubic.transform(t);
+      chars.add(Opacity(
+        opacity: eased,
+        child: Transform.translate(
+          offset: Offset(0, (1 - eased) * 18),
+          child: Text(
+            _text[i],
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 40,
+              fontWeight: FontWeight.w900,
+              letterSpacing: -1.0,
+              height: 1.0,
+            ),
+          ),
+        ),
+      ));
+    }
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: chars,
+    );
+  }
+}
+
 class _Sheen extends StatelessWidget {
-  final double t; // 0..1
+  final double t;
   const _Sheen({required this.t});
 
   @override
@@ -323,54 +392,12 @@ class _Sheen extends StatelessWidget {
                 end: Alignment.bottomRight,
                 colors: [
                   Colors.transparent,
-                  const Color(0x11FFFFFF).withValues(alpha: 0.08),
+                  const Color(0x11FFFFFF).withValues(alpha: 0.09),
                   Colors.transparent,
                 ],
               ),
             ),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-/// "MewSify" wordmark with a shimmer highlight sweeping across the
-/// letters as it fades in.
-class _Wordmark extends StatelessWidget {
-  final double shimmer; // 0..1
-  const _Wordmark({required this.shimmer});
-
-  @override
-  Widget build(BuildContext context) {
-    return ShaderMask(
-      blendMode: BlendMode.srcATop,
-      shaderCallback: (rect) {
-        // A soft white streak that travels left→right across the text.
-        final phase = (shimmer * 1.6) - 0.3;
-        return LinearGradient(
-          begin: Alignment.centerLeft,
-          end: Alignment.centerRight,
-          stops: [
-            (phase - 0.2).clamp(0.0, 1.0),
-            phase.clamp(0.0, 1.0),
-            (phase + 0.2).clamp(0.0, 1.0),
-          ],
-          colors: const [
-            Color(0xFFFFFFFF),
-            Color(0xFFCFEEDA),
-            Color(0xFFFFFFFF),
-          ],
-        ).createShader(rect);
-      },
-      child: const Text(
-        'MewSify',
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: 40,
-          fontWeight: FontWeight.w900,
-          letterSpacing: -1.0,
-          height: 1.0,
         ),
       ),
     );
